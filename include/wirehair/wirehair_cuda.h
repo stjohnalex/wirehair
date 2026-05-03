@@ -43,6 +43,10 @@ typedef struct WirehairCudaPerfStats_t
     uint64_t kernel_us;
     uint64_t d2h_us;
     uint64_t sync_us;
+    uint64_t h2d_event_us;
+    uint64_t kernel_event_us;
+    uint64_t d2h_event_us;
+    uint64_t e2e_event_us;
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
 } WirehairCudaPerfStats;

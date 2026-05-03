@@ -44,6 +44,9 @@ struct Config
     uint64_t Seed = 0x1234abcd9876ULL;
     std::string OutputPath = "test-output/ab-bench/ab-benchmark.json";
     std::string IoRoot = "test-output/ab-bench/io";
+    bool Quiet = false;
+    bool Stress = false;
+    uint32_t CudaBackendMode = WirehairCudaBackend_CudaPrefer;
 };
 
 class XorShift64
@@ -133,8 +136,16 @@ struct CudaPerfStatsResult
     uint64_t KernelUs = 0;
     uint64_t D2hUs = 0;
     uint64_t SyncUs = 0;
+    uint64_t H2dEventUs = 0;
+    uint64_t KernelEventUs = 0;
+    uint64_t D2hEventUs = 0;
+    uint64_t E2eEventUs = 0;
     uint64_t BytesH2d = 0;
     uint64_t BytesD2h = 0;
+    uint64_t CoreOffloadCalls = 0;
+    double KernelSharePct = 0.0;
+    double TransferSyncSharePct = 0.0;
+    double AvgBytesPerCall = 0.0;
 };
 
 static uint64_t NowUs()
@@ -216,6 +227,23 @@ static bool ParseArgs(int argc, char** argv, Config& cfg)
             cfg.OutputPath = val;
         } else if (arg == "--io-root") {
             cfg.IoRoot = val;
+        } else if (arg == "--quiet") {
+            cfg.Quiet = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
+        } else if (arg == "--stress") {
+            cfg.Stress = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
+        } else if (arg == "--cuda-backend") {
+            if (val == "auto") {
+                cfg.CudaBackendMode = WirehairCudaBackend_Auto;
+            } else if (val == "cpuonly") {
+                cfg.CudaBackendMode = WirehairCudaBackend_CpuOnly;
+            } else if (val == "cudaprefer") {
+                cfg.CudaBackendMode = WirehairCudaBackend_CudaPrefer;
+            } else if (val == "cudaonly") {
+                cfg.CudaBackendMode = WirehairCudaBackend_CudaOnly;
+            } else {
+                std::cerr << "Unknown --cuda-backend value: " << val << std::endl;
+                return false;
+            }
         } else if (arg == "--trials") {
             const unsigned long long parsed = std::strtoull(val.c_str(), &end, 10);
             if (!end || *end != '\0') {
@@ -929,8 +957,16 @@ static void WriteJson(
         << ",\"kernel_us\":" << cudaStats.KernelUs
         << ",\"d2h_us\":" << cudaStats.D2hUs
         << ",\"sync_us\":" << cudaStats.SyncUs
+        << ",\"h2d_event_us\":" << cudaStats.H2dEventUs
+        << ",\"kernel_event_us\":" << cudaStats.KernelEventUs
+        << ",\"d2h_event_us\":" << cudaStats.D2hEventUs
+        << ",\"e2e_event_us\":" << cudaStats.E2eEventUs
         << ",\"bytes_h2d\":" << cudaStats.BytesH2d
         << ",\"bytes_d2h\":" << cudaStats.BytesD2h
+        << ",\"core_offload_calls\":" << cudaStats.CoreOffloadCalls
+        << ",\"kernel_share_pct\":" << cudaStats.KernelSharePct
+        << ",\"transfer_sync_share_pct\":" << cudaStats.TransferSyncSharePct
+        << ",\"avg_bytes_per_call\":" << cudaStats.AvgBytesPerCall
         << "}\n";
 
     out << "}\n";
@@ -1016,6 +1052,13 @@ static void PrintSummary(
                   << " kernel=" << cudaStats.KernelUs
                   << " d2h=" << cudaStats.D2hUs
                   << " sync=" << cudaStats.SyncUs
+                  << " h2d_evt=" << cudaStats.H2dEventUs
+                  << " kernel_evt=" << cudaStats.KernelEventUs
+                  << " d2h_evt=" << cudaStats.D2hEventUs
+                  << " e2e_evt=" << cudaStats.E2eEventUs
+                  << " kernel_share_pct=" << std::fixed << std::setprecision(2) << cudaStats.KernelSharePct
+                  << " transfer_sync_share_pct=" << cudaStats.TransferSyncSharePct
+                  << " avg_bytes_per_call=" << cudaStats.AvgBytesPerCall
                   << " bytes_h2d=" << cudaStats.BytesH2d
                   << " bytes_d2h=" << cudaStats.BytesD2h
                   << std::endl;
@@ -1059,7 +1102,7 @@ int main(int argc, char** argv)
 #if defined(AB_USE_CUDA)
     WirehairCudaConfig cudaConfig = {};
     wirehair_cuda_get_default_config(&cudaConfig);
-    cudaConfig.backend_mode = WirehairCudaBackend_CudaPrefer;
+    cudaConfig.backend_mode = cfg.CudaBackendMode;
     if (wirehair_cuda_set_config(&cudaConfig) != Wirehair_Success) {
         std::cerr << "wirehair_cuda_set_config failed" << std::endl;
         return 4;
@@ -1074,13 +1117,22 @@ int main(int argc, char** argv)
     EnsureDirectory(cfg.IoRoot);
 
     std::vector<CoreCaseResult> core;
-    const uint32_t Ns[] = {64, 256, 1024};
-    const uint32_t blocks[] = {1300, 4096};
-    const uint32_t losses[] = {10, 30};
+    static const uint32_t kNsDefault[] = {64, 256, 1024};
+    static const uint32_t kBlocksDefault[] = {1300, 4096};
+    static const uint32_t kLossesDefault[] = {10, 30};
+    static const uint32_t kNsStress[] = {64, 256, 1024, 2048, 4096};
+    static const uint32_t kBlocksStress[] = {1300, 4096, 8192};
+    static const uint32_t kLossesStress[] = {10, 30, 45};
+    const uint32_t* Ns = cfg.Stress ? kNsStress : kNsDefault;
+    const uint32_t* blocks = cfg.Stress ? kBlocksStress : kBlocksDefault;
+    const uint32_t* losses = cfg.Stress ? kLossesStress : kLossesDefault;
+    const size_t nCount = cfg.Stress ? (sizeof(kNsStress) / sizeof(kNsStress[0])) : (sizeof(kNsDefault) / sizeof(kNsDefault[0]));
+    const size_t bCount = cfg.Stress ? (sizeof(kBlocksStress) / sizeof(kBlocksStress[0])) : (sizeof(kBlocksDefault) / sizeof(kBlocksDefault[0]));
+    const size_t lCount = cfg.Stress ? (sizeof(kLossesStress) / sizeof(kLossesStress[0])) : (sizeof(kLossesDefault) / sizeof(kLossesDefault[0]));
     std::vector<std::tuple<uint32_t, uint32_t, uint32_t> > coreInputs;
-    for (size_t ni = 0; ni < sizeof(Ns) / sizeof(Ns[0]); ++ni) {
-        for (size_t bi = 0; bi < sizeof(blocks) / sizeof(blocks[0]); ++bi) {
-            for (size_t li = 0; li < sizeof(losses) / sizeof(losses[0]); ++li) {
+    for (size_t ni = 0; ni < nCount; ++ni) {
+        for (size_t bi = 0; bi < bCount; ++bi) {
+            for (size_t li = 0; li < lCount; ++li) {
                 coreInputs.push_back(std::make_tuple(Ns[ni], blocks[bi], losses[li]));
             }
         }
@@ -1140,12 +1192,30 @@ int main(int argc, char** argv)
         cudaStats.KernelUs = stats.kernel_us;
         cudaStats.D2hUs = stats.d2h_us;
         cudaStats.SyncUs = stats.sync_us;
+        cudaStats.H2dEventUs = stats.h2d_event_us;
+        cudaStats.KernelEventUs = stats.kernel_event_us;
+        cudaStats.D2hEventUs = stats.d2h_event_us;
+        cudaStats.E2eEventUs = stats.e2e_event_us;
         cudaStats.BytesH2d = stats.bytes_h2d;
         cudaStats.BytesD2h = stats.bytes_d2h;
+        cudaStats.CoreOffloadCalls = stats.encode_calls + stats.decode_calls;
+        const uint64_t transferSyncUs = stats.h2d_event_us + stats.d2h_event_us;
+        const uint64_t totalObservedUs = transferSyncUs + stats.kernel_event_us;
+        if (totalObservedUs > 0) {
+            cudaStats.KernelSharePct = (100.0 * static_cast<double>(stats.kernel_event_us)) / static_cast<double>(totalObservedUs);
+            cudaStats.TransferSyncSharePct =
+                (100.0 * static_cast<double>(transferSyncUs)) / static_cast<double>(totalObservedUs);
+        }
+        if (cudaStats.CoreOffloadCalls > 0) {
+            cudaStats.AvgBytesPerCall =
+                static_cast<double>(stats.bytes_h2d + stats.bytes_d2h) / static_cast<double>(cudaStats.CoreOffloadCalls);
+        }
     }
 #endif
 
-    PrintSummary(core, parity, churn, storage, scaling, cudaStats);
+    if (!cfg.Quiet) {
+        PrintSummary(core, parity, churn, storage, scaling, cudaStats);
+    }
     WriteJson(cfg.OutputPath, cfg, core, parity, churn, storage, scaling, cudaStats);
     std::cout << "Wrote benchmark results: " << cfg.OutputPath << std::endl;
     return 0;

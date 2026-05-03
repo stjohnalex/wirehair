@@ -28,6 +28,7 @@
 */
 
 #include "WirehairCodec.h"
+#include "WirehairCudaDispatch.h"
 
 
 //------------------------------------------------------------------------------
@@ -4127,16 +4128,18 @@ uint32_t Codec::Encode(
             CAT_DEBUG_ASSERT(peel_x < _recovery_rows);
 
             // Mix in each column
-            gf256_add_mem(
-                data_out,
-                _recovery_blocks + _block_bytes * peel_x,
-                copyBytes);
+            const uint8_t* GF256_RESTRICT peelSrc = _recovery_blocks + _block_bytes * peel_x;
+            if (!WirehairCudaDispatchXorInPlace(data_out, peelSrc, copyBytes)) {
+                gf256_add_mem(data_out, peelSrc, copyBytes);
+            }
         }
 
         CAT_DEBUG_ASSERT((unsigned)(_block_count + mix.Columns[0]) < _recovery_rows);
 
         // Mix first mixer block in directly
-        gf256_add_mem(data_out, mix0_src, copyBytes);
+        if (!WirehairCudaDispatchXorInPlace(data_out, mix0_src, copyBytes)) {
+            gf256_add_mem(data_out, mix0_src, copyBytes);
+        }
     }
     else
     {

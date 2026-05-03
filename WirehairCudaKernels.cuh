@@ -12,8 +12,43 @@ struct WirehairCudaKernelStats
     uint64_t kernel_us;
     uint64_t d2h_us;
     uint64_t sync_us;
+    uint64_t h2d_event_us;
+    uint64_t kernel_event_us;
+    uint64_t d2h_event_us;
+    uint64_t e2e_event_us;
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
+};
+
+enum WirehairCudaCoreOp : uint32_t
+{
+    WirehairCudaCoreOp_None = 0,
+    WirehairCudaCoreOp_EncodeParity = 1,
+    WirehairCudaCoreOp_DecodeSolve = 2,
+};
+
+struct WirehairCudaCoreBatchParams
+{
+    uint32_t struct_bytes;
+    uint32_t op;
+    uint32_t item_count;
+    uint32_t item_stride_bytes;
+    uint32_t item_bytes;
+    uint32_t options;
+};
+
+enum WirehairCudaCoreBatchOption : uint32_t
+{
+    WirehairCudaCoreBatchOption_None = 0,
+    WirehairCudaCoreBatchOption_AllowHostRegister = 1 << 0,
+    WirehairCudaCoreBatchOption_SkipOutputCopy = 1 << 1,
+};
+
+struct WirehairCudaCoreBatchResult
+{
+    uint32_t struct_bytes;
+    uint32_t processed_count;
+    uint32_t checksum;
 };
 
 bool WirehairCudaKernelProbe(uint32_t* deviceCountOut);
@@ -21,6 +56,12 @@ bool WirehairCudaKernelEnableDevice(int32_t deviceOrdinal);
 bool WirehairCudaKernelConfigure(uint32_t streamCount, uint32_t usePinnedMemory);
 bool WirehairCudaKernelEncodeAssist(void* data, uint32_t bytes);
 bool WirehairCudaKernelDecodeAssist(const void* data, uint32_t bytes, uint32_t* checksumOut);
+bool WirehairCudaKernelXorInPlace(void* destData, const void* srcData, uint32_t bytes);
+bool WirehairCudaKernelProcessBatch(
+    const WirehairCudaCoreBatchParams* params,
+    const void* inputData,
+    void* outputData,
+    WirehairCudaCoreBatchResult* resultOut);
 void WirehairCudaKernelResetStats();
 bool WirehairCudaKernelGetStats(WirehairCudaKernelStats* statsOut);
 

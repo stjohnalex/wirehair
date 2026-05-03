@@ -30,11 +30,16 @@ To build the software in this repo:
 On Windows, use Visual Studio 2022 with the Desktop C++ workload.
 Open `wirehair.sln` and build `Debug|x64` or `Release|x64`.
 
-CUDA support is provided through the `wirehair_cuda` project and benchmark
-variant projects in `msvc/`. For CUDA builds, install the Visual Studio CUDA
-build customization and a CUDA toolkit version supported by your local setup.
-The `wirehair_cuda.vcxproj` project now fails early with a clear error when
-CUDA BuildCustomizations are missing, so it cannot silently run CPU fallback.
+CUDA support is provided through the **`wirehair_cuda` static library** project
+and the **`ab_benchmark_cuda`** console app in `msvc/`. The library itself is
+not an executable; run or debug **`ab_benchmark_cuda`**, or use **F5 on
+`wirehair_cuda`** (configured to launch the CUDA benchmark exe next to the
+built `.lib`). Build **`ab_benchmark_cuda`** at least once so that exe exists.
+
+For CUDA builds, install the Visual Studio CUDA build customization and a CUDA
+toolkit version supported by your local setup. The `wirehair_cuda.vcxproj`
+project fails early with a clear error when CUDA BuildCustomizations are
+missing, so it cannot silently fall back to CPU.
 
 For the checked-in MSVC solution (`wirehair.sln`), the UnitTest target now writes
 configuration-specific binaries to avoid file-lock collisions between Debug and Release:

@@ -252,6 +252,95 @@ def print_variant_summary(report: Dict) -> None:
             f"d2h={int(cuda_perf.get('d2h_us', 0))} "
             f"sync={int(cuda_perf.get('sync_us', 0))}"
         )
+        print(
+            "  cuda stages_event(us) "
+            f"h2d_evt={int(cuda_perf.get('h2d_event_us', 0))} "
+            f"kernel_evt={int(cuda_perf.get('kernel_event_us', 0))} "
+            f"d2h_evt={int(cuda_perf.get('d2h_event_us', 0))} "
+            f"e2e_evt={int(cuda_perf.get('e2e_event_us', 0))}"
+        )
+        print(
+            "  cuda utilization "
+            f"offload_calls={int(cuda_perf.get('core_offload_calls', 0))} "
+            f"kernel_share_pct={float(cuda_perf.get('kernel_share_pct', 0.0)):.2f} "
+            f"transfer_sync_share_pct={float(cuda_perf.get('transfer_sync_share_pct', 0.0)):.2f} "
+            f"avg_bytes_per_call={float(cuda_perf.get('avg_bytes_per_call', 0.0)):.2f}"
+        )
+
+
+def summarize_filtered_core_delta(report: Dict, metric: str, predicate) -> float:
+    rows = report.get("core", [])
+    values = []
+    for row in rows:
+        key = row.get("key", [])
+        if len(key) < 3:
+            continue
+        n = int(key[0])
+        block = int(key[1])
+        loss = int(key[2])
+        if not predicate(n, block, loss):
+            continue
+        metric_payload = row.get("metrics", {}).get(metric, {})
+        values.append(float(metric_payload.get("delta_pct", 0.0)))
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def min_filtered_core_delta(report: Dict, metric: str, predicate) -> float:
+    rows = report.get("core", [])
+    values = []
+    for row in rows:
+        key = row.get("key", [])
+        if len(key) < 3:
+            continue
+        n = int(key[0])
+        block = int(key[1])
+        loss = int(key[2])
+        if not predicate(n, block, loss):
+            continue
+        metric_payload = row.get("metrics", {}).get(metric, {})
+        values.append(float(metric_payload.get("delta_pct", 0.0)))
+    if not values:
+        return 0.0
+    return min(values)
+
+
+def print_final_results_table(control_label: str, entries: List[Dict], variant_reports: List[Dict]) -> None:
+    report_by_label = {x["label"]: x for x in variant_reports}
+    ordered = sorted(entries, key=lambda r: r["core_encode_mbps"], reverse=True)
+
+    print("")
+    print("=== FINAL COMPARISON TABLE ===")
+    header = (
+        f"{'variant':<18} {'core_enc':>9} {'core_dec':>9} {'core_rec':>9} "
+        f"{'stor_w':>8} {'stor_r':>8} {'thr_peak':>10} {'enc_vs_ctl':>11} {'dec_vs_ctl':>11}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for row in ordered:
+        label = row["label"]
+        if label == control_label:
+            enc_delta = 0.0
+            dec_delta = 0.0
+        else:
+            report = report_by_label.get(label, {})
+            summary = report.get("summary", {})
+            enc_delta = float(summary.get("core_encode_mbps_avg_delta_pct", 0.0))
+            dec_delta = float(summary.get("core_decode_mbps_avg_delta_pct", 0.0))
+        thr = f"{row['thread_peak_encode_mbps']:.1f}@{int(row['thread_peak_threads'])}t"
+        print(
+            f"{label:<18} "
+            f"{row['core_encode_mbps']:>9.2f} "
+            f"{row['core_decode_mbps']:>9.2f} "
+            f"{row['core_recover_mbps']:>9.2f} "
+            f"{row['storage_write_mbps']:>8.2f} "
+            f"{row['storage_read_mbps']:>8.2f} "
+            f"{thr:>10} "
+            f"{enc_delta:>10.2f}% "
+            f"{dec_delta:>10.2f}%"
+        )
 
 
 def main() -> int:
@@ -264,6 +353,42 @@ def main() -> int:
         type=float,
         default=None,
         help="If set, fail unless CUDA core encode avg delta vs control >= this percentage.",
+    )
+    parser.add_argument(
+        "--require-cuda-stress-encode-delta",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA stress-cluster encode delta (N>=1024, block>=4096, loss>=30) meets this percentage.",
+    )
+    parser.add_argument(
+        "--require-cuda-stress-decode-delta",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA stress-cluster decode delta (N>=1024, block>=4096, loss>=30) meets this percentage.",
+    )
+    parser.add_argument(
+        "--require-cuda-stress-encode-min-delta",
+        type=float,
+        default=None,
+        help="If set, fail unless the minimum CUDA stress encode delta for any stress case meets this percentage.",
+    )
+    parser.add_argument(
+        "--require-cuda-stress-decode-min-delta",
+        type=float,
+        default=None,
+        help="If set, fail unless the minimum CUDA stress decode delta for any stress case meets this percentage.",
+    )
+    parser.add_argument(
+        "--require-cuda-kernel-share-pct",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA kernel_share_pct >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-core-offload-calls",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA core_offload_calls >= this value.",
     )
     args = parser.parse_args()
 
@@ -301,6 +426,8 @@ def main() -> int:
     for entry in ranking:
         print_variant_summary(entry)
 
+    print_final_results_table(str(control.get("variant", "control")), leaderboard_rows, variant_reports)
+
     if args.require_cuda_core_encode_delta is not None:
         cuda_entry = next((x for x in variant_reports if x.get("label") == "cuda"), None)
         if cuda_entry is None:
@@ -311,6 +438,73 @@ def main() -> int:
             print(
                 f"CUDA core encode gate failed: {core_delta:.2f}% "
                 f"< required {args.require_cuda_core_encode_delta:.2f}%"
+            )
+            return 3
+
+    if (args.require_cuda_stress_encode_delta is not None or
+            args.require_cuda_stress_decode_delta is not None or
+            args.require_cuda_stress_encode_min_delta is not None or
+            args.require_cuda_stress_decode_min_delta is not None):
+        cuda_entry = next((x for x in variant_reports if x.get("label") == "cuda"), None)
+        if cuda_entry is None:
+            print("CUDA stress gate requested but no cuda variant was supplied.")
+            return 3
+        predicate = lambda n, block, loss: n >= 1024 and block >= 4096 and loss >= 30
+        stress_encode = summarize_filtered_core_delta(
+            cuda_entry,
+            "encode_mbps",
+            predicate,
+        )
+        stress_decode = summarize_filtered_core_delta(
+            cuda_entry,
+            "decode_mbps",
+            predicate,
+        )
+        stress_encode_min = min_filtered_core_delta(cuda_entry, "encode_mbps", predicate)
+        stress_decode_min = min_filtered_core_delta(cuda_entry, "decode_mbps", predicate)
+        if args.require_cuda_stress_encode_delta is not None and stress_encode < args.require_cuda_stress_encode_delta:
+            print(
+                f"CUDA stress encode gate failed: {stress_encode:.2f}% "
+                f"< required {args.require_cuda_stress_encode_delta:.2f}%"
+            )
+            return 3
+        if args.require_cuda_stress_decode_delta is not None and stress_decode < args.require_cuda_stress_decode_delta:
+            print(
+                f"CUDA stress decode gate failed: {stress_decode:.2f}% "
+                f"< required {args.require_cuda_stress_decode_delta:.2f}%"
+            )
+            return 3
+        if args.require_cuda_stress_encode_min_delta is not None and stress_encode_min < args.require_cuda_stress_encode_min_delta:
+            print(
+                f"CUDA stress encode minimum gate failed: {stress_encode_min:.2f}% "
+                f"< required {args.require_cuda_stress_encode_min_delta:.2f}%"
+            )
+            return 3
+        if args.require_cuda_stress_decode_min_delta is not None and stress_decode_min < args.require_cuda_stress_decode_min_delta:
+            print(
+                f"CUDA stress decode minimum gate failed: {stress_decode_min:.2f}% "
+                f"< required {args.require_cuda_stress_decode_min_delta:.2f}%"
+            )
+            return 3
+
+    if args.require_cuda_kernel_share_pct is not None or args.require_cuda_core_offload_calls is not None:
+        cuda_entry = next((x for x in variant_reports if x.get("label") == "cuda"), None)
+        if cuda_entry is None:
+            print("CUDA utilization gate requested but no cuda variant was supplied.")
+            return 3
+        cuda_perf = cuda_entry.get("cuda_perf", {})
+        kernel_share = float(cuda_perf.get("kernel_share_pct", 0.0))
+        offload_calls = float(cuda_perf.get("core_offload_calls", 0.0))
+        if args.require_cuda_kernel_share_pct is not None and kernel_share < args.require_cuda_kernel_share_pct:
+            print(
+                f"CUDA kernel share gate failed: {kernel_share:.2f}% "
+                f"< required {args.require_cuda_kernel_share_pct:.2f}%"
+            )
+            return 3
+        if args.require_cuda_core_offload_calls is not None and offload_calls < args.require_cuda_core_offload_calls:
+            print(
+                f"CUDA offload call gate failed: {offload_calls:.0f} "
+                f"< required {args.require_cuda_core_offload_calls:.0f}"
             )
             return 3
 

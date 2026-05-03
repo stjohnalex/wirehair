@@ -80,6 +80,19 @@
     <IntDir>$(ProjectDir)..\build\intermediate\$(Configuration)\$(ProjectName)\</IntDir>
     <TargetName>wirehair_cuda</TargetName>
   </PropertyGroup>
+  <!-- wirehair_cuda is a static library; F5 launches the linked CUDA benchmark exe (build ab_benchmark_cuda first). -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="LocalDebuggerSettings">
+    <LocalDebuggerCommand>$(OutDir)ab_benchmark_cuda_Debug.exe</LocalDebuggerCommand>
+    <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
+    <LocalDebuggerCommandArguments>--output "$(OutDir)cuda_smoke.json" --io-root "$(OutDir)cuda_smoke_io" --trials 1 --seed 1</LocalDebuggerCommandArguments>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="LocalDebuggerSettings">
+    <LocalDebuggerCommand>$(OutDir)ab_benchmark_cuda_Release.exe</LocalDebuggerCommand>
+    <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
+    <LocalDebuggerCommandArguments>--output "$(OutDir)cuda_smoke.json" --io-root "$(OutDir)cuda_smoke_io" --trials 1 --seed 1</LocalDebuggerCommandArguments>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>

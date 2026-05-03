@@ -10,6 +10,37 @@
 
 #if defined(WIREHAIR_ENABLE_CUDA) && defined(WIREHAIR_HAS_COMPILED_CUDA_KERNELS)
 #include "WirehairCudaKernels.cuh"
+#else
+enum WirehairCudaCoreOp : uint32_t
+{
+    WirehairCudaCoreOp_None = 0,
+    WirehairCudaCoreOp_EncodeParity = 1,
+    WirehairCudaCoreOp_DecodeSolve = 2,
+};
+
+enum WirehairCudaCoreBatchOption : uint32_t
+{
+    WirehairCudaCoreBatchOption_None = 0,
+    WirehairCudaCoreBatchOption_AllowHostRegister = 1 << 0,
+    WirehairCudaCoreBatchOption_SkipOutputCopy = 1 << 1,
+};
+
+struct WirehairCudaCoreBatchParams
+{
+    uint32_t struct_bytes;
+    uint32_t op;
+    uint32_t item_count;
+    uint32_t item_stride_bytes;
+    uint32_t item_bytes;
+    uint32_t options;
+};
+
+struct WirehairCudaCoreBatchResult
+{
+    uint32_t struct_bytes;
+    uint32_t processed_count;
+    uint32_t checksum;
+};
 #endif
 
 namespace {
@@ -20,8 +51,12 @@ std::atomic<uint32_t> g_streamCount(1);
 std::atomic<uint32_t> g_usePinnedMemory(1);
 std::atomic<int32_t> g_cudaReadyState(0); // 0 unknown, 1 ready, -1 unavailable
 std::atomic<int32_t> g_cudaReadyOrdinal((std::numeric_limits<int32_t>::min)());
+std::atomic<uint32_t> g_dynamicOffloadEncodeBytes(16U * 1024U);
+std::atomic<uint32_t> g_dynamicOffloadDecodeBytes(16U * 1024U);
+std::atomic<uint32_t> g_cudaDecisionCounter(0);
 
 static const uint32_t kMinCudaOffloadBytes = 16U * 1024U;
+static const uint32_t kMaxCudaOffloadBytes = 2U * 1024U * 1024U;
 
 thread_local WirehairCudaPath g_lastPath = WirehairCudaPath_CPU;
 
@@ -72,6 +107,35 @@ bool KernelDecodeAssist(const void* data, uint32_t bytes, uint32_t* checksumOut)
 #endif
 }
 
+bool KernelXorInPlace(void* destData, const void* srcData, uint32_t bytes)
+{
+#if defined(WIREHAIR_ENABLE_CUDA) && defined(WIREHAIR_HAS_COMPILED_CUDA_KERNELS)
+    return WirehairCudaKernelXorInPlace(destData, srcData, bytes);
+#else
+    (void)destData;
+    (void)srcData;
+    (void)bytes;
+    return false;
+#endif
+}
+
+bool KernelProcessBatch(
+    const WirehairCudaCoreBatchParams* params,
+    const void* inputData,
+    void* outputData,
+    WirehairCudaCoreBatchResult* resultOut)
+{
+#if defined(WIREHAIR_ENABLE_CUDA) && defined(WIREHAIR_HAS_COMPILED_CUDA_KERNELS)
+    return WirehairCudaKernelProcessBatch(params, inputData, outputData, resultOut);
+#else
+    (void)params;
+    (void)inputData;
+    (void)outputData;
+    (void)resultOut;
+    return false;
+#endif
+}
+
 bool KernelConfigure(uint32_t streamCount, uint32_t usePinnedMemory)
 {
 #if defined(WIREHAIR_ENABLE_CUDA) && defined(WIREHAIR_HAS_COMPILED_CUDA_KERNELS)
@@ -107,6 +171,10 @@ bool KernelGetStats(WirehairCudaPerfStats* statsOut)
     statsOut->kernel_us = kernelStats.kernel_us;
     statsOut->d2h_us = kernelStats.d2h_us;
     statsOut->sync_us = kernelStats.sync_us;
+    statsOut->h2d_event_us = kernelStats.h2d_event_us;
+    statsOut->kernel_event_us = kernelStats.kernel_event_us;
+    statsOut->d2h_event_us = kernelStats.d2h_event_us;
+    statsOut->e2e_event_us = kernelStats.e2e_event_us;
     statsOut->bytes_h2d = kernelStats.bytes_h2d;
     statsOut->bytes_d2h = kernelStats.bytes_d2h;
     return true;
@@ -201,7 +269,12 @@ WirehairResult DecodeCpuOnly(
     return codec->DecodeFeed(blockId, blockData, dataBytes);
 }
 
-bool ShouldAttemptCuda(bool* cudaRequiredOut, uint32_t bytesToProcess)
+bool ShouldAttemptCuda(
+    bool* cudaRequiredOut,
+    uint32_t bytesToProcess,
+    bool decodePath,
+    uint32_t itemCount,
+    uint32_t itemBytes)
 {
     const uint32_t backendMode = g_backendMode.load(std::memory_order_relaxed);
     const bool cudaRequired = backendMode == WirehairCudaBackend_CudaOnly;
@@ -212,8 +285,44 @@ bool ShouldAttemptCuda(bool* cudaRequiredOut, uint32_t bytesToProcess)
         return false;
     }
 
-    if (!cudaRequired && bytesToProcess < kMinCudaOffloadBytes) {
+    const uint32_t dynamicThreshold = decodePath
+        ? g_dynamicOffloadDecodeBytes.load(std::memory_order_relaxed)
+        : g_dynamicOffloadEncodeBytes.load(std::memory_order_relaxed);
+    const uint32_t minItems = decodePath ? 24U : 16U;
+    const uint32_t minItemBytes = decodePath ? 1024U : 2048U;
+    if (!cudaRequired && (itemCount < minItems || itemBytes < minItemBytes)) {
         return false;
+    }
+    if (!cudaRequired && bytesToProcess < dynamicThreshold) {
+        return false;
+    }
+    const uint32_t decisionCount = g_cudaDecisionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((decisionCount % 32) == 0)
+    {
+        WirehairCudaPerfStats stats = {};
+        stats.struct_bytes = sizeof(WirehairCudaPerfStats);
+        if (KernelGetStats(&stats) && stats.encode_calls + stats.decode_calls > 8)
+        {
+            uint64_t transferUs = stats.h2d_event_us + stats.d2h_event_us;
+            uint64_t kernelUs = stats.kernel_event_us;
+            if (transferUs == 0 || kernelUs == 0) {
+                transferUs = stats.h2d_us + stats.d2h_us + stats.sync_us;
+                kernelUs = stats.kernel_us;
+            }
+            uint32_t threshold = decodePath
+                ? g_dynamicOffloadDecodeBytes.load(std::memory_order_relaxed)
+                : g_dynamicOffloadEncodeBytes.load(std::memory_order_relaxed);
+            if (transferUs > ((kernelUs * 3) / 2) && threshold < kMaxCudaOffloadBytes) {
+                threshold = std::min<uint32_t>(kMaxCudaOffloadBytes, threshold * 2U);
+            } else if (kernelUs > transferUs && threshold > kMinCudaOffloadBytes) {
+                threshold = std::max<uint32_t>(kMinCudaOffloadBytes, threshold / 2U);
+            }
+            if (decodePath) {
+                g_dynamicOffloadDecodeBytes.store(threshold, std::memory_order_relaxed);
+            } else {
+                g_dynamicOffloadEncodeBytes.store(threshold, std::memory_order_relaxed);
+            }
+        }
     }
     return IsCudaReady();
 }
@@ -231,28 +340,11 @@ WirehairResult WirehairCudaDispatchEncode(
         return Wirehair_InvalidInput;
     }
 
-    const WirehairResult cpuResult = EncodeCpuOnly(codec, blockId, blockDataOut, outBytes, dataBytesOut);
-    if (cpuResult != Wirehair_Success) {
-        return cpuResult;
+    const uint32_t backendMode = g_backendMode.load(std::memory_order_relaxed);
+    if (backendMode == WirehairCudaBackend_CudaOnly) {
+        return Wirehair_UnsupportedPlatform;
     }
-
-    bool cudaRequired = false;
-    const bool useCuda = ShouldAttemptCuda(&cudaRequired, *dataBytesOut);
-    if (!useCuda) {
-        return cudaRequired ? Wirehair_UnsupportedPlatform : Wirehair_Success;
-    }
-
-#if defined(WIREHAIR_ENABLE_CUDA)
-    if (!KernelEncodeAssist(blockDataOut, *dataBytesOut)) {
-        g_lastPath = WirehairCudaPath_CPU;
-        return cudaRequired ? Wirehair_Error : Wirehair_Success;
-    }
-    g_lastPath = WirehairCudaPath_CUDA;
-    return Wirehair_Success;
-#else
-    (void)cudaRequired;
-    return Wirehair_Success;
-#endif
+    return EncodeCpuOnly(codec, blockId, blockDataOut, outBytes, dataBytesOut);
 }
 
 WirehairResult WirehairCudaDispatchDecode(
@@ -265,24 +357,26 @@ WirehairResult WirehairCudaDispatchDecode(
         return Wirehair_InvalidInput;
     }
 
-    bool cudaRequired = false;
-    const bool useCuda = ShouldAttemptCuda(&cudaRequired, dataBytes);
-
-    if (useCuda) {
-#if defined(WIREHAIR_ENABLE_CUDA)
-        uint32_t checksum = 0;
-        if (KernelDecodeAssist(blockData, dataBytes, &checksum)) {
-            (void)checksum;
-            g_lastPath = WirehairCudaPath_CUDA;
-        } else if (cudaRequired) {
-            return Wirehair_Error;
-        }
-#endif
-    } else if (cudaRequired) {
+    const uint32_t backendMode = g_backendMode.load(std::memory_order_relaxed);
+    if (backendMode == WirehairCudaBackend_CudaOnly) {
         return Wirehair_UnsupportedPlatform;
     }
-
     return DecodeCpuOnly(codec, blockId, blockData, dataBytes);
+}
+
+bool WirehairCudaDispatchXorInPlace(
+    void* destData,
+    const void* srcData,
+    uint32_t bytes)
+{
+    if (!destData || !srcData || bytes == 0) {
+        return false;
+    }
+    bool cudaRequired = false;
+    if (!ShouldAttemptCuda(&cudaRequired, bytes, false, 1, bytes)) {
+        return false;
+    }
+    return KernelXorInPlace(destData, srcData, bytes);
 }
 
 extern "C" {
@@ -319,6 +413,9 @@ WIREHAIR_EXPORT WirehairResult wirehair_cuda_set_config(
     g_usePinnedMemory.store(config->use_pinned_memory != 0 ? 1U : 0U, std::memory_order_relaxed);
     g_cudaReadyState.store(0, std::memory_order_relaxed);
     g_cudaReadyOrdinal.store((std::numeric_limits<int32_t>::min)(), std::memory_order_relaxed);
+    g_dynamicOffloadEncodeBytes.store(kMinCudaOffloadBytes, std::memory_order_relaxed);
+    g_dynamicOffloadDecodeBytes.store(kMinCudaOffloadBytes, std::memory_order_relaxed);
+    g_cudaDecisionCounter.store(0, std::memory_order_relaxed);
     KernelConfigure(g_streamCount.load(std::memory_order_relaxed), g_usePinnedMemory.load(std::memory_order_relaxed));
     return Wirehair_Success;
 }
@@ -410,9 +507,18 @@ WIREHAIR_EXPORT WirehairResult wirehair_cuda_encode_batch(
     const uint64_t totalBytes64 = static_cast<uint64_t>(request->block_count) * request->block_stride_bytes;
     const uint32_t maxU32 = (std::numeric_limits<uint32_t>::max)();
     const uint32_t totalBytes = totalBytes64 > maxU32 ? maxU32 : static_cast<uint32_t>(totalBytes64);
-    if (ShouldAttemptCuda(&cudaRequired, totalBytes))
+    if (ShouldAttemptCuda(&cudaRequired, totalBytes, false, request->block_count, request->block_bytes))
     {
-        if (!KernelEncodeAssist(request->block_data_out, totalBytes))
+        WirehairCudaCoreBatchParams params = {};
+        params.struct_bytes = sizeof(WirehairCudaCoreBatchParams);
+        params.op = WirehairCudaCoreOp_EncodeParity;
+        params.item_count = request->block_count;
+        params.item_stride_bytes = request->block_stride_bytes;
+        params.item_bytes = request->block_bytes;
+        params.options = WirehairCudaCoreBatchOption_AllowHostRegister;
+        WirehairCudaCoreBatchResult batchResult = {};
+        batchResult.struct_bytes = sizeof(WirehairCudaCoreBatchResult);
+        if (!KernelProcessBatch(&params, request->block_data_out, request->block_data_out, &batchResult))
         {
             wirehair_free(codec);
             if (cudaRequired) {
@@ -452,10 +558,18 @@ WIREHAIR_EXPORT WirehairResult wirehair_cuda_decode_batch(
     const uint64_t totalBytes64 = static_cast<uint64_t>(request->symbol_count) * request->block_stride_bytes;
     const uint32_t maxU32 = (std::numeric_limits<uint32_t>::max)();
     const uint32_t totalBytes = totalBytes64 > maxU32 ? maxU32 : static_cast<uint32_t>(totalBytes64);
-    if (ShouldAttemptCuda(&cudaRequired, totalBytes))
+    if (ShouldAttemptCuda(&cudaRequired, totalBytes, true, request->symbol_count, request->block_bytes))
     {
-        uint32_t checksum = 0;
-        if (!KernelDecodeAssist(request->block_data, totalBytes, &checksum))
+        WirehairCudaCoreBatchParams params = {};
+        params.struct_bytes = sizeof(WirehairCudaCoreBatchParams);
+        params.op = WirehairCudaCoreOp_DecodeSolve;
+        params.item_count = request->symbol_count;
+        params.item_stride_bytes = request->block_stride_bytes;
+        params.item_bytes = request->block_bytes;
+        params.options = WirehairCudaCoreBatchOption_AllowHostRegister | WirehairCudaCoreBatchOption_SkipOutputCopy;
+        WirehairCudaCoreBatchResult batchResult = {};
+        batchResult.struct_bytes = sizeof(WirehairCudaCoreBatchResult);
+        if (!KernelProcessBatch(&params, request->block_data, nullptr, &batchResult))
         {
             wirehair_free(decoder);
             if (cudaRequired) {

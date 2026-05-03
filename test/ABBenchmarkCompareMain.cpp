@@ -30,9 +30,11 @@ struct Config
 {
     std::string OutputDir = "ab-bench";
     uint32_t Trials = 0;
-    uint32_t MinTrials = 2;
-    uint32_t CampaignSeconds = 360;
+    uint32_t MinTrials = 8;
+    uint32_t CampaignSeconds = 900;
     uint64_t Seed = 0x1234abcd9876ULL;
+    /** Pass --require-cuda-* thresholds to BenchmarkCompareReport.py (exit 3 if CUDA loses). */
+    bool EnforceCudaGates = false;
 };
 
 struct VariantSpec
@@ -112,6 +114,10 @@ static bool ParseArgs(int argc, char** argv, Config& cfg)
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
+        if (arg == "--enforce-cuda-gates") {
+            cfg.EnforceCudaGates = true;
+            continue;
+        }
         if (i + 1 >= argc) {
             std::cerr << "Missing value for " << arg << std::endl;
             return false;
@@ -154,6 +160,88 @@ static bool ParseArgs(int argc, char** argv, Config& cfg)
 
 static int RunProcess(const std::string& exe, const std::vector<std::string>& args, bool searchPath)
 {
+    std::cout << "[ab_benchmark_compare] " << exe;
+    for (size_t i = 0; i < args.size(); ++i) {
+        std::cout << " " << args[i];
+    }
+    std::cout << std::endl;
+
+#if defined(_WIN32)
+    auto quoteArg = [](const std::string& in) -> std::string
+    {
+        if (in.find_first_of(" \t\"") == std::string::npos) {
+            return in;
+        }
+        std::string out = "\"";
+        for (size_t i = 0; i < in.size(); ++i) {
+            if (in[i] == '"') {
+                out += "\\\"";
+            } else {
+                out += in[i];
+            }
+        }
+        out += "\"";
+        return out;
+    };
+
+    std::string commandLine = quoteArg(exe);
+    for (size_t i = 0; i < args.size(); ++i) {
+        commandLine += " ";
+        commandLine += quoteArg(args[i]);
+    }
+    std::vector<char> commandBuffer(commandLine.begin(), commandLine.end());
+    commandBuffer.push_back('\0');
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    const char* applicationName = searchPath ? nullptr : exe.c_str();
+    const BOOL created = CreateProcessA(
+        applicationName,
+        commandBuffer.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    if (!created) {
+        return -1;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    auto heartbeatAt = start + std::chrono::seconds(5);
+    for (;;)
+    {
+        const DWORD waitCode = WaitForSingleObject(pi.hProcess, 1000);
+        if (waitCode == WAIT_OBJECT_0) {
+            break;
+        }
+        if (waitCode != WAIT_TIMEOUT) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return -1;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= heartbeatAt)
+        {
+            const auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
+            const int minutes = static_cast<int>(elapsedSec / 60);
+            const int seconds = static_cast<int>(elapsedSec % 60);
+            std::cout << "  ... still running (" << std::setw(2) << std::setfill('0') << minutes
+                      << ":" << std::setw(2) << std::setfill('0') << seconds << " elapsed)" << std::endl;
+            heartbeatAt = now + std::chrono::seconds(5);
+        }
+    }
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<int>(exitCode);
+#else
     std::vector<char*> argv;
     argv.reserve(args.size() + 2);
     argv.push_back(const_cast<char*>(exe.c_str()));
@@ -161,17 +249,11 @@ static int RunProcess(const std::string& exe, const std::vector<std::string>& ar
         argv.push_back(const_cast<char*>(args[i].c_str()));
     }
     argv.push_back(nullptr);
-
-    std::cout << "[ab_benchmark_compare] " << exe;
-    for (size_t i = 0; i < args.size(); ++i) {
-        std::cout << " " << args[i];
-    }
-    std::cout << std::endl;
-
     const intptr_t exitCode = searchPath
         ? _spawnvp(_P_WAIT, exe.c_str(), &argv[0])
         : _spawnv(_P_WAIT, exe.c_str(), &argv[0]);
     return static_cast<int>(exitCode);
+#endif
 }
 
 #if defined(_WIN32)
@@ -269,6 +351,10 @@ static double RunVariantAndMeasureSeconds(
         variant.OutputJson,
         "--io-root",
         ioRoot,
+        "--quiet",
+        "1",
+        "--stress",
+        "1",
         "--trials",
         std::to_string(trials),
         "--seed",
@@ -294,8 +380,10 @@ int main(int argc, char** argv)
             << "Wirehair benchmark suite — runs all variant exes and prints a console comparison.\n"
             << "Usage:\n"
             << "  ab_benchmark_compare [--output-dir <dir>] [--trials <n>] [--min-trials <n>]\n"
-            << "                      [--campaign-seconds <sec>] [--seed <u64>]\n"
-            << "  --trials 0 calibrates trial count from --campaign-seconds (default 360).\n"
+            << "                      [--campaign-seconds <sec>] [--seed <u64>] [--enforce-cuda-gates]\n"
+            << "  Runs variants in --quiet 1 --stress 1 mode by default.\n"
+            << "  --trials 0 calibrates trial count from --campaign-seconds (default 900).\n"
+            << "  --enforce-cuda-gates  optional CI mode: Python exits 3 if CUDA is below thresholds vs control.\n"
             << "Requires sibling exes: ab_benchmark_control[_Release|_Debug], ab_benchmark_simd_avx2*,\n"
             << "ab_benchmark_simd_avx2_lto*, optional ab_benchmark_cuda*.\n";
         return 2;
@@ -420,8 +508,23 @@ int main(int argc, char** argv)
     if (cudaAvailable) {
         pyArgs.push_back("--variant");
         pyArgs.push_back("cuda=" + cudaJson);
-        pyArgs.push_back("--require-cuda-core-encode-delta");
-        pyArgs.push_back("5.0");
+        if (cfg.EnforceCudaGates)
+        {
+            pyArgs.push_back("--require-cuda-core-encode-delta");
+            pyArgs.push_back("5.0");
+            pyArgs.push_back("--require-cuda-stress-encode-delta");
+            pyArgs.push_back("5.0");
+            pyArgs.push_back("--require-cuda-stress-decode-delta");
+            pyArgs.push_back("3.0");
+            pyArgs.push_back("--require-cuda-stress-encode-min-delta");
+            pyArgs.push_back("-8.0");
+            pyArgs.push_back("--require-cuda-stress-decode-min-delta");
+            pyArgs.push_back("-10.0");
+            pyArgs.push_back("--require-cuda-kernel-share-pct");
+            pyArgs.push_back("18.0");
+            pyArgs.push_back("--require-cuda-core-offload-calls");
+            pyArgs.push_back("24");
+        }
     }
     pyArgs.push_back("--out");
     pyArgs.push_back(compareJson);
@@ -447,8 +550,12 @@ int main(int argc, char** argv)
     }
     if (pyResult != 0)
     {
-        std::cerr << "Python comparison step failed (exit " << pyResult << ").\n"
-                  << "Install Python 3, ensure 'python', 'python3', or 'py' is on PATH, or run:\n  "
+        std::cerr << "Python comparison step failed (exit " << pyResult << ").\n";
+        if (pyResult == 3 && cfg.EnforceCudaGates) {
+            std::cerr << "BenchmarkCompareReport.py exit 3: CUDA performance gate failed (--enforce-cuda-gates).\n"
+                      << "Omit --enforce-cuda-gates for a report-only comparison.\n";
+        }
+        std::cerr << "Otherwise ensure Python 3 is on PATH ('python', 'python3', or 'py'), or run manually:\n  "
                   << "python \"" << scriptPath << "\" --control \"" << controlJson << "\" ...\n";
         return 9;
     }
