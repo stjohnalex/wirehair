@@ -47,6 +47,7 @@ struct Config
     bool Quiet = false;
     bool Stress = false;
     uint32_t CudaBackendMode = WirehairCudaBackend_CudaPrefer;
+    bool CoreUseCudaBatch = false;
 };
 
 class XorShift64
@@ -231,6 +232,8 @@ static bool ParseArgs(int argc, char** argv, Config& cfg)
             cfg.Quiet = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
         } else if (arg == "--stress") {
             cfg.Stress = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
+        } else if (arg == "--core-use-cuda-batch") {
+            cfg.CoreUseCudaBatch = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
         } else if (arg == "--cuda-backend") {
             if (val == "auto") {
                 cfg.CudaBackendMode = WirehairCudaBackend_Auto;
@@ -294,7 +297,13 @@ static double PercentileMs(std::vector<double> valuesMs, double pct)
     return valuesMs[lo] * (1.0 - t) + valuesMs[hi] * t;
 }
 
-static CoreCaseResult RunCoreCase(uint32_t N, uint32_t blockBytes, uint32_t lossPercent, uint32_t trials, uint64_t seed)
+static CoreCaseResult RunCoreCase(
+    uint32_t N,
+    uint32_t blockBytes,
+    uint32_t lossPercent,
+    uint32_t trials,
+    uint64_t seed,
+    bool useCudaBatchCore)
 {
     CoreCaseResult r;
     r.N = N;
@@ -335,6 +344,82 @@ static CoreCaseResult RunCoreCase(uint32_t N, uint32_t blockBytes, uint32_t loss
 
         std::vector<uint8_t> encodedBlocks(candidateIds.size() * blockBytes);
         std::vector<uint32_t> encodedLens(candidateIds.size(), 0);
+#if defined(AB_USE_CUDA)
+        if (useCudaBatchCore)
+        {
+            const uint32_t startBlockId = N + 1;
+            const uint32_t symbolCount = std::max<uint32_t>(N + 64, N + (N / 2));
+            std::vector<uint8_t> batchEncoded(static_cast<size_t>(symbolCount) * blockBytes);
+            std::vector<uint32_t> batchLens(symbolCount, 0);
+            WirehairEncodeBatchRequest encReq = {};
+            encReq.request_id = 1;
+            encReq.message = &message[0];
+            encReq.message_bytes = messageBytes;
+            encReq.block_bytes = blockBytes;
+            encReq.start_block_id = startBlockId;
+            encReq.block_count = symbolCount;
+            encReq.block_data_out = &batchEncoded[0];
+            encReq.block_stride_bytes = blockBytes;
+            encReq.bytes_out = &batchLens[0];
+
+            const uint64_t e0 = NowUs();
+            const WirehairResult encResult = wirehair_cuda_encode_batch(&encReq);
+            const uint64_t e1 = NowUs();
+            encodeUs += (e1 - e0);
+            if (encResult != Wirehair_Success) {
+                continue;
+            }
+
+            std::vector<uint32_t> selectedIds;
+            selectedIds.reserve(symbolCount);
+            std::vector<uint8_t> decodeInput;
+            decodeInput.reserve(static_cast<size_t>(symbolCount) * blockBytes);
+            std::vector<uint32_t> decodeLens;
+            decodeLens.reserve(symbolCount);
+            for (uint32_t i = 0; i < symbolCount; ++i)
+            {
+                if (prng.NextBounded(100) < lossPercent) {
+                    continue;
+                }
+                selectedIds.push_back(startBlockId + i);
+                const uint8_t* src = &batchEncoded[static_cast<size_t>(i) * blockBytes];
+                decodeInput.insert(decodeInput.end(), src, src + blockBytes);
+                decodeLens.push_back(batchLens[i]);
+            }
+            if (selectedIds.empty()) {
+                continue;
+            }
+
+            const uint64_t selectedCount = static_cast<uint64_t>(selectedIds.size());
+            encodeBytes += static_cast<uint64_t>(symbolCount) * blockBytes;
+            decodeBytes += selectedCount * blockBytes;
+            const uint64_t d0 = NowUs();
+            WirehairDecodeBatchRequest decReq = {};
+            decReq.request_id = 2;
+            decReq.message_bytes = messageBytes;
+            decReq.block_bytes = blockBytes;
+            decReq.block_ids = &selectedIds[0];
+            decReq.block_data = &decodeInput[0];
+            decReq.block_data_bytes = &decodeLens[0];
+            decReq.symbol_count = static_cast<uint32_t>(selectedIds.size());
+            decReq.block_stride_bytes = blockBytes;
+            decReq.message_out = &recovered[0];
+            const WirehairResult decResult = wirehair_cuda_decode_batch(&decReq);
+            const uint64_t d1 = NowUs();
+            decodeUs += (d1 - d0);
+            if (decResult == Wirehair_Success &&
+                HashBytes(&recovered[0], recovered.size()) == HashBytes(&message[0], message.size()))
+            {
+                ++r.Successes;
+                const uint32_t needed = static_cast<uint32_t>(selectedIds.size());
+                if (needed > N) {
+                    extraSum += (needed - N);
+                }
+                recoverBytes += messageBytes;
+            }
+            continue;
+        }
+#endif
 
         const uint64_t t0 = NowUs();
         WirehairCodec encoder = wirehair_encoder_create(nullptr, &message[0], messageBytes, blockBytes);
@@ -1142,7 +1227,7 @@ int main(int argc, char** argv)
         const uint32_t n = std::get<0>(coreInputs[i]);
         const uint32_t block = std::get<1>(coreInputs[i]);
         const uint32_t loss = std::get<2>(coreInputs[i]);
-        core[i] = RunCoreCase(n, block, loss, cfg.Trials, cfg.Seed + static_cast<uint64_t>(i));
+        core[i] = RunCoreCase(n, block, loss, cfg.Trials, cfg.Seed + static_cast<uint64_t>(i), cfg.CoreUseCudaBatch);
     });
 
     std::vector<ParityCaseResult> parity;
