@@ -4048,7 +4048,9 @@ uint32_t Codec::Encode(
     unsigned copyBytes;
 
     // If this is the last block:
-    if ((uint16_t)block_id == _block_count - 1) {
+    if (block_id < _block_count &&
+        block_id == static_cast<uint32_t>(_block_count - 1))
+    {
         copyBytes = _input_final_bytes;
     }
     else {

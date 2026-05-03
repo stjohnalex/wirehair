@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    LNK1104 on ab_benchmark_*.exe is usually a live lock: the exe is still running
+    (benchmark suite, debugger, AV scan). End the process before link so rebuild succeeds.
+  -->
+  <Target Name="WirehairAbBenchmarkUnlockBeforeLink"
+          BeforeTargets="Link"
+          Condition="'$(ConfigurationType)' == 'Application'
+                     and $(MSBuildProjectFile.StartsWith('ab_benchmark'))">
+    <Message Importance="Low"
+             Text="WirehairAbBenchmarkUnlockBeforeLink: $(TargetFileName)" />
+    <Exec Command="taskkill /IM &quot;$(TargetFileName)&quot; /F /T 2&gt;nul"
+          IgnoreExitCode="true" />
+    <Exec Command="if exist &quot;$(TargetPath)&quot; attrib -r &quot;$(TargetPath)&quot;"
+          IgnoreExitCode="true" />
+  </Target>
+</Project>

@@ -17,54 +17,141 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
-# MSVC temp files
-*.obj
-*.log
-*.ilk
-*.pdb
-*.tlog
-*.idb
+# =========================
+# Build outputs (all MSVC projects → repo-root build/)
+# =========================
+build/
+**/build/
+
+# Typical VS per-project output folders (if OutDir is ever changed)
+[Dd]ebug/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+[Oo]ut/
+[Dd]ist/
+[Tt]arget/
+
+# CMake / other native generators
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+Makefile
+*.build/
+
+# Visual Studio / MSBuild
+.vs/
+**/.vs/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
 *.opensdf
 *.sdf
-*.user
-*.suo
+*.db
+*.opendb
+
+# Compiled objects & toolchain intermediates
+*.obj
+*.o
+*.iobj
+*.pch
+*.ipdb
+*.pgc
+*.pgd
+*.rsp
+*.sbr
+*.tlb
+*.tli
+*.tlh
+*.tmp
+*.tmp_proj
+*_wpftmp.csproj
+*.log
+*.tlog
+*.idb
+*.ilk
+*.meta
+*.exp
+
+# Libraries & binaries produced by the tree (build locally)
+*.lib
+*.dll
+*.exe
+*.app
+*.so
+*.dylib
+*.a
+
+# Symbols / debug databases
+*.pdb
+
+# CUDA / NVRTC caches (optional local speedups)
+*.cache
+
+# =========================
+# Test & benchmark artifacts
+# =========================
+ab-bench/
+**/ab-bench/
+**/ab-bench/**
+
+bench_suite_out/
+bench_*_out/
+*_bench_out/
+**/bench_suite_out/
+
+test-output/
+**/test-output/
+**/test-output/**
+
+msvc/ab-bench/
+msvc/test-output/
+
+# Python tooling & generated test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
 
 # =========================
 # Operating System Files
 # =========================
 
 # OSX
-# =========================
-
 .DS_Store
 .AppleDouble
 .LSOverride
-
-# Thumbnails
 ._*
-
-# Files that might appear on external disk
 .Spotlight-V100
 .Trashes
-
-# Directories potentially created on remote AFP share
 .AppleDB
 .AppleDesktop
 Network Trash Folder
 Temporary Items
 .apdisk
-*.db
-*.opendb
 
-# PyCharm private dir ide
-.idea
-
-#Build cmake dir
-build
-/.vs/wirehair/CopilotIndices/17.14.939.21063
-/.vs/wirehair/FileContentIndex
-/.vs/wirehair/v17
-/ab-bench/io
-/msvc/ab-bench
-/msvc/test-output/ab-bench
-/test-output
+# PyCharm / IDE
+.idea/

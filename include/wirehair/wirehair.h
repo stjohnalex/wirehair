@@ -147,6 +147,15 @@ WIREHAIR_EXPORT WirehairResult wirehair_init_(int expected_version);
 /// WirehairCodec: From wirehair_encoder_create() or wirehair_decoder_create()
 typedef struct WirehairCodec_t { char impl; }* WirehairCodec;
 
+/**
+    Threading contract:
+
+    - Call wirehair_init() successfully before creating codecs.
+    - Distinct WirehairCodec objects may be used concurrently on different threads.
+    - A single WirehairCodec object must not be accessed concurrently from multiple threads.
+    - reuseOpt transfers ownership into wirehair_*_create(); on failure it is released.
+*/
+
 
 /**
     wirehair_encoder_create()
@@ -195,7 +204,7 @@ WIREHAIR_EXPORT WirehairCodec wirehair_encoder_create(
     Returns other codes on error.
 */
 WIREHAIR_EXPORT WirehairResult wirehair_encode(
-    WirehairCodec    codec, ///< Pointer to codec from wirehair_encoder_init()
+    WirehairCodec    codec, ///< Pointer to codec from wirehair_encoder_create()
     unsigned       blockId, ///< Identifier of block to generate
     void*     blockDataOut, ///< Pointer to output block data
     uint32_t      outBytes, ///< Bytes in the output buffer
@@ -232,7 +241,7 @@ WIREHAIR_EXPORT WirehairCodec wirehair_decoder_create(
     Returns Wirehair_Success if data recovery is complete.
     + Use wirehair_recover() or wirehair_recover_block()
       to reconstruct the recovered data.
-    Returns Wirehair_NeedsMoreData if more data is needed to decode.
+    Returns Wirehair_NeedMore if more data is needed to decode.
     Returns other codes on error.
 */
 WIREHAIR_EXPORT WirehairResult wirehair_decode(
@@ -277,7 +286,7 @@ WIREHAIR_EXPORT WirehairResult wirehair_recover(
 WIREHAIR_EXPORT WirehairResult wirehair_recover_block(
     WirehairCodec codec, ///< Codec object
     unsigned    blockId, ///< ID of the block to reconstruct between 0..N-1
-    void*     blockData, ///< Pointer to block data
+    void*  blockDataOut, ///< Pointer to block data
     uint32_t*  bytesOut  ///< Set to the number of data bytes in the block
 );
 
@@ -295,7 +304,7 @@ WIREHAIR_EXPORT WirehairResult wirehair_recover_block(
     application side.
 
     Preconditions:
-    wirehair_decoder_read() returned Wirehair_Success
+    wirehair_decode() returned Wirehair_Success
 
     Returns Wirehair_Success if the operation was successful.
     Returns other codes on error.
@@ -311,6 +320,94 @@ WIREHAIR_EXPORT WirehairResult wirehair_decoder_becomes_encoder(
 */
 WIREHAIR_EXPORT void wirehair_free(
     WirehairCodec codec ///< Codec object to free
+);
+
+//------------------------------------------------------------------------------
+// Throughput-Oriented Threaded Pipeline API
+
+typedef struct WirehairPipeline_t { char impl; }* WirehairPipeline;
+
+typedef enum WirehairPipelineJobType_t
+{
+    WirehairPipelineJob_EncodeBatch = 1,
+    WirehairPipelineJob_DecodeBatch = 2,
+    WirehairPipelineJob_Padding = 0x7fffffff
+} WirehairPipelineJobType;
+
+typedef struct WirehairPipelineConfig_t
+{
+    uint32_t encode_threads;
+    uint32_t decode_threads;
+    uint32_t queue_capacity;
+} WirehairPipelineConfig;
+
+typedef struct WirehairEncodeBatchRequest_t
+{
+    uint64_t request_id;
+    const void* message;
+    uint64_t message_bytes;
+    uint32_t block_bytes;
+    uint32_t start_block_id;
+    uint32_t block_count;
+    void* block_data_out;
+    uint32_t block_stride_bytes;
+    uint32_t* bytes_out;
+} WirehairEncodeBatchRequest;
+
+typedef struct WirehairDecodeBatchRequest_t
+{
+    uint64_t request_id;
+    uint64_t message_bytes;
+    uint32_t block_bytes;
+    const uint32_t* block_ids;
+    const void* block_data;
+    const uint32_t* block_data_bytes;
+    uint32_t symbol_count;
+    uint32_t block_stride_bytes;
+    void* message_out;
+} WirehairDecodeBatchRequest;
+
+typedef struct WirehairPipelineGenerationRequest_t
+{
+    uint32_t job_type;
+    const void* request;
+} WirehairPipelineGenerationRequest;
+
+typedef struct WirehairPipelineEvent_t
+{
+    uint64_t request_id;
+    uint32_t job_type;
+    WirehairResult result;
+    uint32_t produced_count;
+} WirehairPipelineEvent;
+
+WIREHAIR_EXPORT WirehairPipeline wirehair_pipeline_create(
+    const WirehairPipelineConfig* config
+);
+
+WIREHAIR_EXPORT void wirehair_pipeline_free(
+    WirehairPipeline pipeline
+);
+
+WIREHAIR_EXPORT WirehairResult wirehair_encode_batch_async(
+    WirehairPipeline pipeline,
+    const WirehairEncodeBatchRequest* request
+);
+
+WIREHAIR_EXPORT WirehairResult wirehair_decode_batch_async(
+    WirehairPipeline pipeline,
+    const WirehairDecodeBatchRequest* request
+);
+
+WIREHAIR_EXPORT WirehairResult wirehair_pipeline_submit_generation(
+    WirehairPipeline pipeline,
+    const WirehairPipelineGenerationRequest* request
+);
+
+WIREHAIR_EXPORT WirehairResult wirehair_pipeline_poll(
+    WirehairPipeline pipeline,
+    uint32_t timeout_msec,
+    WirehairPipelineEvent* event_out
 );
 
 

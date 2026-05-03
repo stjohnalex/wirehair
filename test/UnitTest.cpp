@@ -1,10 +1,13 @@
 #include <wirehair/wirehair.h>
+#include <wirehair/wirehair_cuda.h>
 
 #include "SiameseTools.h"
 
 #include <iostream>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <thread>
 using namespace std;
 
 #define ENABLE_OMP
@@ -38,6 +41,529 @@ static void FillMessage(uint8_t* message, unsigned bytes, siamese::PCGRandom& pr
             word >>= 8;
         }
     }
+}
+
+static bool Test_ConcurrentInitAndCodecCreate()
+{
+    static const int kThreadCount = 8;
+    static const int kIterationsPerThread = 200;
+    static const uint32_t kMessageBytes = 1023;
+    static const uint32_t kBlockBytes = 64;
+
+    atomic<bool> failed(false);
+    vector<thread> workers;
+    workers.reserve(kThreadCount);
+
+    for (int threadIndex = 0; threadIndex < kThreadCount; ++threadIndex)
+    {
+        workers.emplace_back([threadIndex, &failed]() {
+            siamese::PCGRandom prng;
+            prng.Seed(0x8f3d7211ULL + threadIndex, 0x27b9ca34ULL + threadIndex);
+            vector<uint8_t> message(kMessageBytes);
+            FillMessage(message.data(), kMessageBytes, prng);
+
+            for (int i = 0; i < kIterationsPerThread; ++i)
+            {
+                if (wirehair_init() != Wirehair_Success) {
+                    failed.store(true);
+                    return;
+                }
+
+                WirehairCodec encoder = wirehair_encoder_create(nullptr, message.data(), kMessageBytes, kBlockBytes);
+                WirehairCodec decoder = wirehair_decoder_create(nullptr, kMessageBytes, kBlockBytes);
+                if (!encoder || !decoder)
+                {
+                    if (encoder) {
+                        wirehair_free(encoder);
+                    }
+                    if (decoder) {
+                        wirehair_free(decoder);
+                    }
+                    failed.store(true);
+                    return;
+                }
+
+                wirehair_free(decoder);
+                wirehair_free(encoder);
+            }
+        });
+    }
+
+    for (thread& worker : workers) {
+        worker.join();
+    }
+    return !failed.load();
+}
+
+static bool Test_AsyncBatchDeterminism()
+{
+    static const uint32_t kMessageBytes = 128 * 1024 + 13;
+    static const uint32_t kBlockBytes = 1024;
+    static const uint32_t kStartBlockId = 300;
+    static const uint32_t kBlockCount = 96;
+
+    siamese::PCGRandom prng;
+    prng.Seed(0x71ULL, 0x42ULL);
+    vector<uint8_t> message(kMessageBytes);
+    FillMessage(message.data(), kMessageBytes, prng);
+    vector<uint8_t> encodedSingle(kBlockCount * kBlockBytes, 0);
+    vector<uint8_t> encodedMulti(kBlockCount * kBlockBytes, 0);
+    vector<uint32_t> bytesSingle(kBlockCount, 0);
+    vector<uint32_t> bytesMulti(kBlockCount, 0);
+
+    WirehairPipelineConfig oneCfg = {1, 1, 32};
+    WirehairPipelineConfig manyCfg = {4, 4, 32};
+    WirehairPipeline one = wirehair_pipeline_create(&oneCfg);
+    WirehairPipeline many = wirehair_pipeline_create(&manyCfg);
+    if (!one || !many) {
+        if (one) wirehair_pipeline_free(one);
+        if (many) wirehair_pipeline_free(many);
+        return false;
+    }
+
+    WirehairEncodeBatchRequest reqSingle = {};
+    reqSingle.request_id = 1;
+    reqSingle.message = message.data();
+    reqSingle.message_bytes = kMessageBytes;
+    reqSingle.block_bytes = kBlockBytes;
+    reqSingle.start_block_id = kStartBlockId;
+    reqSingle.block_count = kBlockCount;
+    reqSingle.block_data_out = encodedSingle.data();
+    reqSingle.block_stride_bytes = kBlockBytes;
+    reqSingle.bytes_out = bytesSingle.data();
+
+    WirehairEncodeBatchRequest reqMulti = reqSingle;
+    reqMulti.request_id = 2;
+    reqMulti.block_data_out = encodedMulti.data();
+    reqMulti.bytes_out = bytesMulti.data();
+
+    WirehairPipelineEvent event = {};
+    if (wirehair_encode_batch_async(one, &reqSingle) != Wirehair_Success ||
+        wirehair_encode_batch_async(many, &reqMulti) != Wirehair_Success)
+    {
+        wirehair_pipeline_free(one);
+        wirehair_pipeline_free(many);
+        return false;
+    }
+    while (wirehair_pipeline_poll(one, 1000, &event) == Wirehair_NeedMore) {}
+    if (event.result != Wirehair_Success) {
+        wirehair_pipeline_free(one);
+        wirehair_pipeline_free(many);
+        return false;
+    }
+    while (wirehair_pipeline_poll(many, 1000, &event) == Wirehair_NeedMore) {}
+    if (event.result != Wirehair_Success) {
+        wirehair_pipeline_free(one);
+        wirehair_pipeline_free(many);
+        return false;
+    }
+
+    wirehair_pipeline_free(one);
+    wirehair_pipeline_free(many);
+
+    if (bytesSingle != bytesMulti) {
+        return false;
+    }
+    return memcmp(encodedSingle.data(), encodedMulti.data(), encodedSingle.size()) == 0;
+}
+
+static bool Test_AsyncPipelineStress()
+{
+    const uint32_t kMessageBytes = 64 * 1024 + 17;
+    const uint32_t kBlockBytes = 512;
+    const uint32_t kSymbols = 144;
+    const int kRequests = 48;
+    siamese::PCGRandom prng;
+    prng.Seed(0x9981ULL, 0x5512ULL);
+
+    WirehairPipelineConfig cfg = {8, 8, 64};
+    WirehairPipeline pipeline = wirehair_pipeline_create(&cfg);
+    if (!pipeline) {
+        return false;
+    }
+
+    vector<vector<uint8_t>> messages(kRequests);
+    vector<vector<uint8_t>> encoded(kRequests);
+    vector<vector<uint8_t>> recovered(kRequests);
+    vector<vector<uint32_t>> lens(kRequests);
+    vector<vector<uint32_t>> ids(kRequests);
+    for (int i = 0; i < kRequests; ++i)
+    {
+        messages[i].resize(kMessageBytes);
+        encoded[i].resize(kSymbols * kBlockBytes);
+        recovered[i].resize(kMessageBytes);
+        lens[i].assign(kSymbols, 0);
+        ids[i].assign(kSymbols, 0);
+        FillMessage(messages[i].data(), kMessageBytes, prng);
+        for (uint32_t j = 0; j < kSymbols; ++j) {
+            ids[i][j] = 256 + j;
+        }
+        WirehairEncodeBatchRequest enc = {};
+        enc.request_id = static_cast<uint64_t>(i + 1);
+        enc.message = messages[i].data();
+        enc.message_bytes = kMessageBytes;
+        enc.block_bytes = kBlockBytes;
+        enc.start_block_id = 256;
+        enc.block_count = kSymbols;
+        enc.block_data_out = encoded[i].data();
+        enc.block_stride_bytes = kBlockBytes;
+        enc.bytes_out = lens[i].data();
+        if (wirehair_encode_batch_async(pipeline, &enc) != Wirehair_Success) {
+            wirehair_pipeline_free(pipeline);
+            return false;
+        }
+    }
+
+    int encodeDone = 0;
+    int decodeSubmitted = 0;
+    int decodeDone = 0;
+    vector<uint8_t> seenEncode(kRequests, 0);
+    vector<uint8_t> seenDecode(kRequests, 0);
+    while (decodeDone < kRequests)
+    {
+        WirehairPipelineEvent event = {};
+        if (wirehair_pipeline_poll(pipeline, 2000, &event) != Wirehair_Success) {
+            wirehair_pipeline_free(pipeline);
+            return false;
+        }
+        if (event.job_type == WirehairPipelineJob_EncodeBatch)
+        {
+            const int index = static_cast<int>(event.request_id - 1);
+            if (index < 0 || index >= kRequests || seenEncode[index]) {
+                wirehair_pipeline_free(pipeline);
+                return false;
+            }
+            seenEncode[index] = 1;
+            ++encodeDone;
+            WirehairDecodeBatchRequest dec = {};
+            dec.request_id = static_cast<uint64_t>(1000 + index);
+            dec.message_bytes = kMessageBytes;
+            dec.block_bytes = kBlockBytes;
+            dec.block_ids = ids[index].data();
+            dec.block_data = encoded[index].data();
+            dec.block_data_bytes = lens[index].data();
+            dec.symbol_count = kSymbols;
+            dec.block_stride_bytes = kBlockBytes;
+            dec.message_out = recovered[index].data();
+            if (wirehair_decode_batch_async(pipeline, &dec) != Wirehair_Success) {
+                wirehair_pipeline_free(pipeline);
+                return false;
+            }
+            ++decodeSubmitted;
+        }
+        else if (event.job_type == WirehairPipelineJob_DecodeBatch)
+        {
+            const int index = static_cast<int>(event.request_id - 1000);
+            if (index < 0 || index >= kRequests || seenDecode[index] || event.result != Wirehair_Success) {
+                wirehair_pipeline_free(pipeline);
+                return false;
+            }
+            seenDecode[index] = 1;
+            ++decodeDone;
+        }
+    }
+    wirehair_pipeline_free(pipeline);
+
+    if (encodeDone != kRequests || decodeSubmitted != kRequests) {
+        return false;
+    }
+    for (int i = 0; i < kRequests; ++i)
+    {
+        if (memcmp(messages[i].data(), recovered[i].data(), kMessageBytes) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool Test_ThreadingPerfGates()
+{
+    const uint32_t kMessageBytes = 2 * 1024 * 1024 + 31;
+    const uint32_t kBlockBytes = 2048;
+    const uint32_t kBlocks = 1024;
+    siamese::PCGRandom prng;
+    prng.Seed(0x1abULL, 0x2cdULL);
+    vector<uint8_t> message(kMessageBytes);
+    FillMessage(message.data(), kMessageBytes, prng);
+    vector<uint8_t> out(kBlocks * kBlockBytes, 0);
+    vector<uint32_t> lens(kBlocks, 0);
+
+    auto runPipeline = [&](uint32_t threads) -> double {
+        WirehairPipelineConfig cfg = {threads, threads, 16};
+        WirehairPipeline pipeline = wirehair_pipeline_create(&cfg);
+        if (!pipeline) {
+            return 0.0;
+        }
+        WirehairEncodeBatchRequest req = {};
+        req.request_id = 7 + threads;
+        req.message = message.data();
+        req.message_bytes = kMessageBytes;
+        req.block_bytes = kBlockBytes;
+        req.start_block_id = 300;
+        req.block_count = kBlocks;
+        req.block_data_out = out.data();
+        req.block_stride_bytes = kBlockBytes;
+        req.bytes_out = lens.data();
+        const auto t0 = chrono::high_resolution_clock::now();
+        if (wirehair_encode_batch_async(pipeline, &req) != Wirehair_Success) {
+            wirehair_pipeline_free(pipeline);
+            return 0.0;
+        }
+        WirehairPipelineEvent event = {};
+        while (wirehair_pipeline_poll(pipeline, 2000, &event) == Wirehair_NeedMore) {}
+        const auto t1 = chrono::high_resolution_clock::now();
+        wirehair_pipeline_free(pipeline);
+        if (event.result != Wirehair_Success) {
+            return 0.0;
+        }
+        const double usec = static_cast<double>(chrono::duration_cast<chrono::microseconds>(t1 - t0).count());
+        return usec > 0.0 ? (static_cast<double>(kBlocks * kBlockBytes) / usec) : 0.0;
+    };
+
+    auto runLegacy = [&]() -> double {
+        WirehairCodec encoder = wirehair_encoder_create(nullptr, message.data(), kMessageBytes, kBlockBytes);
+        if (!encoder) {
+            return 0.0;
+        }
+        const auto t0 = chrono::high_resolution_clock::now();
+        for (uint32_t i = 0; i < kBlocks; ++i)
+        {
+            uint32_t written = 0;
+            if (wirehair_encode(encoder, 300 + i, out.data() + i * kBlockBytes, kBlockBytes, &written) != Wirehair_Success)
+            {
+                wirehair_free(encoder);
+                return 0.0;
+            }
+        }
+        const auto t1 = chrono::high_resolution_clock::now();
+        wirehair_free(encoder);
+        const double usec = static_cast<double>(chrono::duration_cast<chrono::microseconds>(t1 - t0).count());
+        return usec > 0.0 ? (static_cast<double>(kBlocks * kBlockBytes) / usec) : 0.0;
+    };
+
+    const double legacy1 = runLegacy();
+    const double pipeline1 = runPipeline(1);
+    const double pipeline8 = runPipeline(8);
+    if (legacy1 <= 0.0 || pipeline1 <= 0.0 || pipeline8 <= 0.0) {
+        return false;
+    }
+
+    // Gate 1: threaded path must not regress single-thread performance by more than 5%.
+    if (pipeline1 < legacy1 * 0.95) {
+        return false;
+    }
+
+    // Gate 2: 8-thread run should have at least 1.5x throughput over pipeline 1-thread.
+    if (pipeline8 < pipeline1 * 1.5) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool Test_CudaConfigRoundTrip()
+{
+    WirehairCudaConfig cfg = {};
+    wirehair_cuda_get_default_config(&cfg);
+    cfg.backend_mode = WirehairCudaBackend_CpuOnly;
+    cfg.stream_count = 2;
+    cfg.use_pinned_memory = 0;
+    if (wirehair_cuda_set_config(&cfg) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairCudaConfig readBack = {};
+    if (wirehair_cuda_get_config(&readBack) != Wirehair_Success) {
+        return false;
+    }
+    return readBack.backend_mode == cfg.backend_mode &&
+        readBack.stream_count == cfg.stream_count &&
+        readBack.use_pinned_memory == cfg.use_pinned_memory;
+}
+
+static bool Test_CudaBatchParityWithCpuFallback()
+{
+    static const uint32_t kMessageBytes = 32768 + 29;
+    static const uint32_t kBlockBytes = 512;
+    static const uint32_t kStartBlockId = 128;
+    static const uint32_t kBlockCount = 48;
+
+    siamese::PCGRandom prng;
+    prng.Seed(0x5312ULL, 0x9123ULL);
+
+    vector<uint8_t> message(kMessageBytes);
+    FillMessage(message.data(), kMessageBytes, prng);
+    vector<uint8_t> cpuEncoded(kBlockCount * kBlockBytes, 0);
+    vector<uint8_t> cudaEncoded(kBlockCount * kBlockBytes, 0);
+    vector<uint32_t> cpuLens(kBlockCount, 0);
+    vector<uint32_t> cudaLens(kBlockCount, 0);
+    vector<uint8_t> cpuRecovered(kMessageBytes, 0);
+    vector<uint8_t> cudaRecovered(kMessageBytes, 0);
+    vector<uint32_t> ids(kBlockCount, 0);
+
+    WirehairCudaConfig cfg = {};
+    wirehair_cuda_get_default_config(&cfg);
+    cfg.backend_mode = WirehairCudaBackend_CpuOnly;
+    if (wirehair_cuda_set_config(&cfg) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairCodec cpu = wirehair_encoder_create(nullptr, message.data(), kMessageBytes, kBlockBytes);
+    if (!cpu) {
+        return false;
+    }
+    for (uint32_t i = 0; i < kBlockCount; ++i)
+    {
+        const unsigned blockId = kStartBlockId + i;
+        ids[i] = blockId;
+        if (wirehair_encode(cpu, blockId, &cpuEncoded[i * kBlockBytes], kBlockBytes, &cpuLens[i]) != Wirehair_Success) {
+            wirehair_free(cpu);
+            return false;
+        }
+    }
+    wirehair_free(cpu);
+
+    cfg.backend_mode = WirehairCudaBackend_CudaPrefer;
+    if (wirehair_cuda_set_config(&cfg) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairEncodeBatchRequest encodeReq = {};
+    encodeReq.request_id = 1;
+    encodeReq.message = message.data();
+    encodeReq.message_bytes = kMessageBytes;
+    encodeReq.block_bytes = kBlockBytes;
+    encodeReq.start_block_id = kStartBlockId;
+    encodeReq.block_count = kBlockCount;
+    encodeReq.block_data_out = cudaEncoded.data();
+    encodeReq.block_stride_bytes = kBlockBytes;
+    encodeReq.bytes_out = cudaLens.data();
+
+    if (wirehair_cuda_encode_batch(&encodeReq) != Wirehair_Success) {
+        return false;
+    }
+    if (cudaLens != cpuLens) {
+        return false;
+    }
+    if (memcmp(cudaEncoded.data(), cpuEncoded.data(), cpuEncoded.size()) != 0) {
+        return false;
+    }
+
+    WirehairDecodeBatchRequest decodeReq = {};
+    decodeReq.request_id = 2;
+    decodeReq.message_bytes = kMessageBytes;
+    decodeReq.block_bytes = kBlockBytes;
+    decodeReq.block_ids = ids.data();
+    decodeReq.block_data = cudaEncoded.data();
+    decodeReq.block_data_bytes = cudaLens.data();
+    decodeReq.symbol_count = kBlockCount;
+    decodeReq.block_stride_bytes = kBlockBytes;
+    decodeReq.message_out = cudaRecovered.data();
+    if (wirehair_cuda_decode_batch(&decodeReq) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairCodec cpuDecoder = wirehair_decoder_create(nullptr, kMessageBytes, kBlockBytes);
+    if (!cpuDecoder) {
+        return false;
+    }
+    for (uint32_t i = 0; i < kBlockCount; ++i)
+    {
+        if (wirehair_decode(cpuDecoder, ids[i], &cpuEncoded[i * kBlockBytes], cpuLens[i]) == Wirehair_Success) {
+            break;
+        }
+    }
+    const WirehairResult recover = wirehair_recover(cpuDecoder, cpuRecovered.data(), kMessageBytes);
+    wirehair_free(cpuDecoder);
+    if (recover != Wirehair_Success) {
+        return false;
+    }
+    return memcmp(cpuRecovered.data(), cudaRecovered.data(), kMessageBytes) == 0;
+}
+
+static bool Test_CudaPerfStatsTelemetry()
+{
+    WirehairCudaPerfStats stats = {};
+    stats.struct_bytes = sizeof(WirehairCudaPerfStats);
+    wirehair_cuda_reset_perf_stats();
+    const WirehairResult before = wirehair_cuda_get_perf_stats(&stats);
+    if (before == Wirehair_UnsupportedPlatform) {
+        return true;
+    }
+    if (before != Wirehair_Success) {
+        return false;
+    }
+
+    static const uint32_t kMessageBytes = 65536 + 13;
+    static const uint32_t kBlockBytes = 1024;
+    static const uint32_t kBlockCount = 96;
+    static const uint32_t kStartBlockId = 200;
+
+    siamese::PCGRandom prng;
+    prng.Seed(0x7711ULL, 0x8122ULL);
+    vector<uint8_t> message(kMessageBytes);
+    FillMessage(message.data(), kMessageBytes, prng);
+    vector<uint8_t> encoded(kBlockCount * kBlockBytes, 0);
+    vector<uint32_t> lens(kBlockCount, 0);
+    vector<uint32_t> ids(kBlockCount, 0);
+    vector<uint8_t> recovered(kMessageBytes, 0);
+    for (uint32_t i = 0; i < kBlockCount; ++i) {
+        ids[i] = kStartBlockId + i;
+    }
+
+    WirehairCudaConfig cfg = {};
+    wirehair_cuda_get_default_config(&cfg);
+    cfg.backend_mode = WirehairCudaBackend_CudaPrefer;
+    cfg.stream_count = 2;
+    cfg.use_pinned_memory = 1;
+    if (wirehair_cuda_set_config(&cfg) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairEncodeBatchRequest encodeReq = {};
+    encodeReq.request_id = 11;
+    encodeReq.message = message.data();
+    encodeReq.message_bytes = kMessageBytes;
+    encodeReq.block_bytes = kBlockBytes;
+    encodeReq.start_block_id = kStartBlockId;
+    encodeReq.block_count = kBlockCount;
+    encodeReq.block_data_out = encoded.data();
+    encodeReq.block_stride_bytes = kBlockBytes;
+    encodeReq.bytes_out = lens.data();
+    if (wirehair_cuda_encode_batch(&encodeReq) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairDecodeBatchRequest decodeReq = {};
+    decodeReq.request_id = 12;
+    decodeReq.message_bytes = kMessageBytes;
+    decodeReq.block_bytes = kBlockBytes;
+    decodeReq.block_ids = ids.data();
+    decodeReq.block_data = encoded.data();
+    decodeReq.block_data_bytes = lens.data();
+    decodeReq.symbol_count = kBlockCount;
+    decodeReq.block_stride_bytes = kBlockBytes;
+    decodeReq.message_out = recovered.data();
+    if (wirehair_cuda_decode_batch(&decodeReq) != Wirehair_Success) {
+        return false;
+    }
+
+    WirehairCudaPerfStats afterStats = {};
+    afterStats.struct_bytes = sizeof(WirehairCudaPerfStats);
+    const WirehairResult after = wirehair_cuda_get_perf_stats(&afterStats);
+    if (after == Wirehair_UnsupportedPlatform) {
+        return true;
+    }
+    if (after != Wirehair_Success) {
+        return false;
+    }
+    if (afterStats.encode_calls == 0 || afterStats.decode_calls == 0) {
+        return false;
+    }
+    if (afterStats.h2d_us == 0 || afterStats.kernel_us == 0) {
+        return false;
+    }
+    return true;
 }
 
 #pragma warning(disable: 4505)
@@ -885,6 +1411,55 @@ int main()
         SIAMESE_DEBUG_BREAK();
         cout << "!!! Wirehair initialization failed: " << initResult << endl;
         return -1;
+    }
+
+    if (!Test_ConcurrentInitAndCodecCreate())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! Concurrent init/create test failed" << endl;
+        return -5;
+    }
+
+    if (!Test_AsyncBatchDeterminism())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! Async batch determinism test failed" << endl;
+        return -6;
+    }
+
+    if (!Test_AsyncPipelineStress())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! Async pipeline stress test failed" << endl;
+        return -7;
+    }
+
+    if (!Test_ThreadingPerfGates())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! Threading performance gates failed" << endl;
+        return -8;
+    }
+
+    if (!Test_CudaConfigRoundTrip())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! CUDA config round-trip test failed" << endl;
+        return -9;
+    }
+
+    if (!Test_CudaBatchParityWithCpuFallback())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! CUDA batch parity test failed" << endl;
+        return -10;
+    }
+
+    if (!Test_CudaPerfStatsTelemetry())
+    {
+        SIAMESE_DEBUG_BREAK();
+        cout << "!!! CUDA perf stats telemetry test failed" << endl;
+        return -11;
     }
 
     if (!ReadmeExample())

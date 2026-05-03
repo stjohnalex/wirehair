@@ -27,11 +27,252 @@
 */
 
 #include <wirehair/wirehair.h>
+#include <wirehair/wirehair_cuda.h>
 #include "WirehairCodec.h"
+#include "WirehairCudaDispatch.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <mutex>
 #include <new> // std::nothrow
+#include <thread>
+#include <vector>
 
-static bool m_init = false;
+static std::atomic<bool> m_init(false);
+
+namespace {
+
+static uint32_t NormalizeThreadCount(uint32_t requested)
+{
+    if (requested > 0) {
+        return requested;
+    }
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc > 0 ? static_cast<uint32_t>(hc) : 1U;
+}
+
+class PipelineRuntime
+{
+public:
+    explicit PipelineRuntime(const WirehairPipelineConfig& config)
+        : QueueCapacity(config.queue_capacity > 0 ? config.queue_capacity : 64)
+    {
+        const uint32_t encodeThreads = NormalizeThreadCount(config.encode_threads);
+        const uint32_t decodeThreads = NormalizeThreadCount(config.decode_threads);
+        for (uint32_t i = 0; i < encodeThreads; ++i) {
+            EncodeThreads.emplace_back([this]() { EncodeWorkerLoop(); });
+        }
+        for (uint32_t i = 0; i < decodeThreads; ++i) {
+            DecodeThreads.emplace_back([this]() { DecodeWorkerLoop(); });
+        }
+    }
+
+    ~PipelineRuntime()
+    {
+        {
+            std::lock_guard<std::mutex> lock(QueueMutex);
+            Stopping.store(true, std::memory_order_release);
+        }
+        EncodeQueueCv.notify_all();
+        DecodeQueueCv.notify_all();
+        CompletionCv.notify_all();
+        for (std::thread& t : EncodeThreads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        for (std::thread& t : DecodeThreads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    }
+
+    WirehairResult SubmitEncode(const WirehairEncodeBatchRequest& req)
+    {
+        if (!req.message || req.message_bytes < 1 || req.block_bytes < 1 || req.block_count < 1 ||
+            !req.block_data_out || req.block_stride_bytes < req.block_bytes || !req.bytes_out)
+        {
+            return Wirehair_InvalidInput;
+        }
+        {
+            std::lock_guard<std::mutex> lock(QueueMutex);
+            if (Stopping.load(std::memory_order_acquire) || EncodeQueue.size() >= QueueCapacity) {
+                return Wirehair_Error;
+            }
+            EncodeQueue.push_back(req);
+        }
+        EncodeQueueCv.notify_one();
+        return Wirehair_Success;
+    }
+
+    WirehairResult SubmitDecode(const WirehairDecodeBatchRequest& req)
+    {
+        if (req.message_bytes < 1 || req.block_bytes < 1 || req.symbol_count < 1 || !req.block_ids ||
+            !req.block_data || !req.block_data_bytes || !req.message_out || req.block_stride_bytes < req.block_bytes)
+        {
+            return Wirehair_InvalidInput;
+        }
+        {
+            std::lock_guard<std::mutex> lock(QueueMutex);
+            if (Stopping.load(std::memory_order_acquire) || DecodeQueue.size() >= QueueCapacity) {
+                return Wirehair_Error;
+            }
+            DecodeQueue.push_back(req);
+        }
+        DecodeQueueCv.notify_one();
+        return Wirehair_Success;
+    }
+
+    WirehairResult Poll(uint32_t timeoutMsec, WirehairPipelineEvent* eventOut)
+    {
+        if (!eventOut) {
+            return Wirehair_InvalidInput;
+        }
+        std::unique_lock<std::mutex> lock(CompletionMutex);
+        if (Completions.empty())
+        {
+            if (timeoutMsec == 0) {
+                return Wirehair_NeedMore;
+            }
+            const bool ready = CompletionCv.wait_for(
+                lock,
+                std::chrono::milliseconds(timeoutMsec),
+                [this]() {
+                    return !Completions.empty() || Stopping.load(std::memory_order_acquire);
+                });
+            if (!ready || Completions.empty()) {
+                return Wirehair_NeedMore;
+            }
+        }
+        *eventOut = Completions.front();
+        Completions.pop_front();
+        return Wirehair_Success;
+    }
+
+private:
+    void PushCompletion(const WirehairPipelineEvent& event)
+    {
+        {
+            std::lock_guard<std::mutex> lock(CompletionMutex);
+            Completions.push_back(event);
+        }
+        CompletionCv.notify_one();
+    }
+
+    void EncodeWorkerLoop()
+    {
+        for (;;)
+        {
+            WirehairEncodeBatchRequest req = {};
+            {
+                std::unique_lock<std::mutex> lock(QueueMutex);
+                EncodeQueueCv.wait(lock, [this]() {
+                    return Stopping.load(std::memory_order_acquire) || !EncodeQueue.empty();
+                });
+                if (Stopping.load(std::memory_order_acquire) && EncodeQueue.empty()) {
+                    return;
+                }
+                req = EncodeQueue.front();
+                EncodeQueue.pop_front();
+            }
+
+            WirehairPipelineEvent completion = {};
+            completion.request_id = req.request_id;
+            completion.job_type = WirehairPipelineJob_EncodeBatch;
+            completion.result = Wirehair_Error;
+            completion.produced_count = 0;
+
+            WirehairCodec codec = wirehair_encoder_create(nullptr, req.message, req.message_bytes, req.block_bytes);
+            if (codec)
+            {
+                completion.result = Wirehair_Success;
+                for (uint32_t i = 0; i < req.block_count; ++i)
+                {
+                    uint8_t* out = reinterpret_cast<uint8_t*>(req.block_data_out) + static_cast<size_t>(i) * req.block_stride_bytes;
+                    uint32_t bytesOut = 0;
+                    const WirehairResult enc = wirehair_encode(codec, req.start_block_id + i, out, req.block_bytes, &bytesOut);
+                    req.bytes_out[i] = bytesOut;
+                    if (enc != Wirehair_Success) {
+                        completion.result = enc;
+                        break;
+                    }
+                    completion.produced_count = i + 1;
+                }
+                wirehair_free(codec);
+            }
+
+            PushCompletion(completion);
+        }
+    }
+
+    void DecodeWorkerLoop()
+    {
+        for (;;)
+        {
+            WirehairDecodeBatchRequest req = {};
+            {
+                std::unique_lock<std::mutex> lock(QueueMutex);
+                DecodeQueueCv.wait(lock, [this]() {
+                    return Stopping.load(std::memory_order_acquire) || !DecodeQueue.empty();
+                });
+                if (Stopping.load(std::memory_order_acquire) && DecodeQueue.empty()) {
+                    return;
+                }
+                req = DecodeQueue.front();
+                DecodeQueue.pop_front();
+            }
+
+            WirehairPipelineEvent completion = {};
+            completion.request_id = req.request_id;
+            completion.job_type = WirehairPipelineJob_DecodeBatch;
+            completion.result = Wirehair_Error;
+            completion.produced_count = 0;
+
+            WirehairCodec decoder = wirehair_decoder_create(nullptr, req.message_bytes, req.block_bytes);
+            if (decoder)
+            {
+                completion.result = Wirehair_NeedMore;
+                const uint8_t* blockData = reinterpret_cast<const uint8_t*>(req.block_data);
+                for (uint32_t i = 0; i < req.symbol_count; ++i)
+                {
+                    const uint8_t* symbol = blockData + static_cast<size_t>(i) * req.block_stride_bytes;
+                    const WirehairResult dec = wirehair_decode(decoder, req.block_ids[i], symbol, req.block_data_bytes[i]);
+                    completion.produced_count = i + 1;
+                    if (dec == Wirehair_Success) {
+                        completion.result = wirehair_recover(decoder, req.message_out, req.message_bytes);
+                        break;
+                    }
+                    if (dec != Wirehair_NeedMore) {
+                        completion.result = dec;
+                        break;
+                    }
+                }
+                wirehair_free(decoder);
+            }
+
+            PushCompletion(completion);
+        }
+    }
+
+    const size_t QueueCapacity;
+    std::atomic<bool> Stopping{false};
+    std::mutex QueueMutex;
+    std::condition_variable EncodeQueueCv;
+    std::condition_variable DecodeQueueCv;
+    std::deque<WirehairEncodeBatchRequest> EncodeQueue;
+    std::deque<WirehairDecodeBatchRequest> DecodeQueue;
+    std::vector<std::thread> EncodeThreads;
+    std::vector<std::thread> DecodeThreads;
+
+    std::mutex CompletionMutex;
+    std::condition_variable CompletionCv;
+    std::deque<WirehairPipelineEvent> Completions;
+};
+
+} // namespace
 
 
 extern "C" {
@@ -56,6 +297,7 @@ WIREHAIR_EXPORT const char *wirehair_result_string(
     case Wirehair_BadInput_LargeN:   return "Wirehair_BadInput_LargeN";
     case Wirehair_ExtraInsufficient: return "Wirehair_ExtraInsufficient";
     case Wirehair_InvalidInput:      return "Wirehair_InvalidInput";
+    case Wirehair_Error:             return "Wirehair_Error";
     case Wirehair_OOM:               return "Wirehair_OOM";
     case Wirehair_UnsupportedPlatform: return "Wirehair_UnsupportedPlatform";
     default:
@@ -79,7 +321,7 @@ WIREHAIR_EXPORT WirehairResult wirehair_init_(int expected_version)
         return Wirehair_UnsupportedPlatform;
     }
 
-    m_init = true;
+    m_init.store(true, std::memory_order_release);
     return Wirehair_Success;
 }
 
@@ -91,7 +333,7 @@ WIREHAIR_EXPORT WirehairCodec wirehair_encoder_create(
 )
 {
     // If input is invalid:
-    if (!m_init || !message || messageBytes < 1 || blockBytes < 1) {
+    if (!m_init.load(std::memory_order_acquire) || !message || messageBytes < 1 || blockBytes < 1) {
         return nullptr;
     }
 
@@ -136,14 +378,7 @@ WIREHAIR_EXPORT WirehairResult wirehair_encode(
 
     wirehair::Codec* session = reinterpret_cast<wirehair::Codec*>(codec);
 
-    const uint32_t writtenBytes = session->Encode(blockId, blockDataOut, outBytes);
-    *dataBytesOut = writtenBytes;
-
-    if (writtenBytes <= 0) {
-        return Wirehair_InvalidInput;
-    }
-
-    return Wirehair_Success;
+    return WirehairCudaDispatchEncode(session, blockId, blockDataOut, outBytes, dataBytesOut);
 }
 
 WIREHAIR_EXPORT WirehairCodec wirehair_decoder_create(
@@ -153,7 +388,7 @@ WIREHAIR_EXPORT WirehairCodec wirehair_decoder_create(
 )
 {
     // If input is invalid:
-    if (!m_init || messageBytes < 1 || blockBytes < 1) {
+    if (!m_init.load(std::memory_order_acquire) || messageBytes < 1 || blockBytes < 1) {
         return nullptr;
     }
 
@@ -192,7 +427,7 @@ WIREHAIR_EXPORT WirehairResult wirehair_decode(
 
     wirehair::Codec* decoder = reinterpret_cast<wirehair::Codec*>(codec);
 
-    return decoder->DecodeFeed(blockId, blockData, dataBytes);
+    return WirehairCudaDispatchDecode(decoder, blockId, blockData, dataBytes);
 }
 
 WIREHAIR_EXPORT WirehairResult wirehair_recover(
@@ -249,6 +484,85 @@ WIREHAIR_EXPORT void wirehair_free(
     wirehair::Codec* object = reinterpret_cast<wirehair::Codec*>(codec);
 
     delete object;
+}
+
+WIREHAIR_EXPORT WirehairPipeline wirehair_pipeline_create(
+    const WirehairPipelineConfig* config
+)
+{
+    if (!m_init.load(std::memory_order_acquire) || !config) {
+        return nullptr;
+    }
+    PipelineRuntime* runtime = new (std::nothrow) PipelineRuntime(*config);
+    return reinterpret_cast<WirehairPipeline>(runtime);
+}
+
+WIREHAIR_EXPORT void wirehair_pipeline_free(
+    WirehairPipeline pipeline
+)
+{
+    PipelineRuntime* runtime = reinterpret_cast<PipelineRuntime*>(pipeline);
+    delete runtime;
+}
+
+WIREHAIR_EXPORT WirehairResult wirehair_encode_batch_async(
+    WirehairPipeline pipeline,
+    const WirehairEncodeBatchRequest* request
+)
+{
+    if (!pipeline || !request) {
+        return Wirehair_InvalidInput;
+    }
+    PipelineRuntime* runtime = reinterpret_cast<PipelineRuntime*>(pipeline);
+    return runtime->SubmitEncode(*request);
+}
+
+WIREHAIR_EXPORT WirehairResult wirehair_decode_batch_async(
+    WirehairPipeline pipeline,
+    const WirehairDecodeBatchRequest* request
+)
+{
+    if (!pipeline || !request) {
+        return Wirehair_InvalidInput;
+    }
+    PipelineRuntime* runtime = reinterpret_cast<PipelineRuntime*>(pipeline);
+    return runtime->SubmitDecode(*request);
+}
+
+WIREHAIR_EXPORT WirehairResult wirehair_pipeline_submit_generation(
+    WirehairPipeline pipeline,
+    const WirehairPipelineGenerationRequest* request
+)
+{
+    if (!pipeline || !request || !request->request) {
+        return Wirehair_InvalidInput;
+    }
+    switch (request->job_type)
+    {
+    case WirehairPipelineJob_EncodeBatch:
+        return wirehair_encode_batch_async(
+            pipeline,
+            reinterpret_cast<const WirehairEncodeBatchRequest*>(request->request));
+    case WirehairPipelineJob_DecodeBatch:
+        return wirehair_decode_batch_async(
+            pipeline,
+            reinterpret_cast<const WirehairDecodeBatchRequest*>(request->request));
+    default:
+        return Wirehair_InvalidInput;
+    }
+}
+
+WIREHAIR_EXPORT WirehairResult wirehair_pipeline_poll(
+    WirehairPipeline pipeline,
+    uint32_t timeout_msec,
+    WirehairPipelineEvent* event_out
+)
+{
+    if (!pipeline) {
+        return Wirehair_InvalidInput;
+    }
+    PipelineRuntime* runtime = reinterpret_cast<PipelineRuntime*>(pipeline);
+    return runtime->Poll(timeout_msec, event_out);
 }
 
 

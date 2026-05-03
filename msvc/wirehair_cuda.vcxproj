@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{A1B2C3D4-E5F6-4789-A0B1-C2D3E4F50011}</ProjectGuid>
+    <RootNamespace>wirehair_cuda</RootNamespace>
+    <ProjectName>wirehair_cuda</ProjectName>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <CudaToolkitDir Condition="'$(CudaToolkitDir)'=='' and '$(CUDA_PATH_V13_2)'!=''">$(CUDA_PATH_V13_2)\</CudaToolkitDir>
+    <CudaToolkitDir Condition="'$(CudaToolkitDir)'=='' and '$(CUDA_PATH)'!='' and Exists('$(CUDA_PATH)\bin\nvcc.exe')">$(CUDA_PATH)\</CudaToolkitDir>
+    <CudaToolkitDir Condition="'$(CudaToolkitDir)'=='' and Exists('C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\nvcc.exe')">C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\</CudaToolkitDir>
+
+    <CudaCustomizationsRoot>$(VCTargetsPath)\BuildCustomizations</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)')">$(MSBuildExtensionsPath32)\Microsoft\VC\v170\BuildCustomizations</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)')">$(MSBuildExtensionsPath)\Microsoft\VC\v170\BuildCustomizations</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH)'!=''">$(CUDA_PATH)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V13_0)'!=''">$(CUDA_PATH_V13_0)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_8)'!=''">$(CUDA_PATH_V12_8)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_7)'!=''">$(CUDA_PATH_V12_7)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_6)'!=''">$(CUDA_PATH_V12_6)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_5)'!=''">$(CUDA_PATH_V12_5)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_4)'!=''">$(CUDA_PATH_V12_4)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_3)'!=''">$(CUDA_PATH_V12_3)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_2)'!=''">$(CUDA_PATH_V12_2)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_1)'!=''">$(CUDA_PATH_V12_1)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V12_0)'!=''">$(CUDA_PATH_V12_0)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+    <CudaCustomizationsRoot Condition="!Exists('$(CudaCustomizationsRoot)') and '$(CUDA_PATH_V11_8)'!=''">$(CUDA_PATH_V11_8)\extras\visual_studio_integration\MSBuildExtensions</CudaCustomizationsRoot>
+
+    <CudaPropsPath Condition="Exists('$(CudaCustomizationsRoot)\CUDA 13.2.props')">$(CudaCustomizationsRoot)\CUDA 13.2.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 13.1.props')">$(CudaCustomizationsRoot)\CUDA 13.1.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 13.0.props')">$(CudaCustomizationsRoot)\CUDA 13.0.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.8.props')">$(CudaCustomizationsRoot)\CUDA 12.8.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.7.props')">$(CudaCustomizationsRoot)\CUDA 12.7.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.6.props')">$(CudaCustomizationsRoot)\CUDA 12.6.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.5.props')">$(CudaCustomizationsRoot)\CUDA 12.5.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.4.props')">$(CudaCustomizationsRoot)\CUDA 12.4.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.3.props')">$(CudaCustomizationsRoot)\CUDA 12.3.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.2.props')">$(CudaCustomizationsRoot)\CUDA 12.2.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.1.props')">$(CudaCustomizationsRoot)\CUDA 12.1.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 12.0.props')">$(CudaCustomizationsRoot)\CUDA 12.0.props</CudaPropsPath>
+    <CudaPropsPath Condition="'$(CudaPropsPath)'=='' and Exists('$(CudaCustomizationsRoot)\CUDA 11.8.props')">$(CudaCustomizationsRoot)\CUDA 11.8.props</CudaPropsPath>
+    <CudaTargetsPath Condition="'$(CudaPropsPath)'!=''">$([System.String]::Copy('$(CudaPropsPath)').Replace('.props', '.targets'))</CudaTargetsPath>
+  </PropertyGroup>
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(CudaPropsPath)" Condition="'$(CudaPropsPath)'!=''" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\build\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\intermediate\$(Configuration)\$(ProjectName)\</IntDir>
+    <TargetName>wirehair_cuda</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_LIB;_DEBUG;_CRT_SECURE_NO_WARNINGS;WIREHAIR_ENABLE_CUDA=1;WIREHAIR_HAS_COMPILED_CUDA_KERNELS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <CudaCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <CodeGeneration>compute_75,sm_75</CodeGeneration>
+    </CudaCompile>
+    <Lib>
+      <OutputFile>$(OutDir)$(TargetName).lib</OutputFile>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_LIB;NDEBUG;_CRT_SECURE_NO_WARNINGS;WIREHAIR_ENABLE_CUDA=1;WIREHAIR_HAS_COMPILED_CUDA_KERNELS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <WholeProgramOptimization>true</WholeProgramOptimization>
+      <AdditionalOptions>/Qpar %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <CudaCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\include;$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <CodeGeneration>compute_75,sm_75</CodeGeneration>
+    </CudaCompile>
+    <Lib>
+      <OutputFile>$(OutDir)$(TargetName).lib</OutputFile>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\wirehair.cpp" />
+    <ClCompile Include="..\wirehair_cuda.cpp" />
+    <ClCompile Include="..\gf256.cpp" />
+    <ClCompile Include="..\WirehairCodec.cpp" />
+    <ClCompile Include="..\WirehairTools.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="..\WirehairCudaKernels.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\gf256.h" />
+    <ClInclude Include="..\WirehairCodec.h" />
+    <ClInclude Include="..\WirehairCudaDispatch.h" />
+    <ClInclude Include="..\WirehairCudaKernels.cuh" />
+    <ClInclude Include="..\WirehairTools.h" />
+    <ClInclude Include="..\include\wirehair\wirehair.h" />
+    <ClInclude Include="..\include\wirehair\wirehair_cuda.h" />
+  </ItemGroup>
+  <Target Name="RequireCudaIntegration" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(CudaPropsPath)'==''"
+           Text="CUDA Visual Studio integration was not found. Checked '$(CudaCustomizationsRoot)'. Current CUDA_PATH='$(CUDA_PATH)'. Install NVIDIA CUDA Toolkit with Visual Studio integration (BuildCustomizations)." />
+    <Error Condition="'$(CudaTargetsPath)'=='' or !Exists('$(CudaTargetsPath)')"
+           Text="CUDA targets file was not found for $(CudaPropsPath)." />
+    <Error Condition="'$(CudaToolkitDir)'=='' or !Exists('$(CudaToolkitDir)\bin\nvcc.exe')"
+           Text="CUDA toolkit binaries were not found. CudaToolkitDir='$(CudaToolkitDir)'. Set CudaToolkitDir or install a full CUDA toolkit with nvcc." />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(CudaTargetsPath)" Condition="'$(CudaTargetsPath)'!='' and Exists('$(CudaTargetsPath)')" />
+  </ImportGroup>
+</Project>

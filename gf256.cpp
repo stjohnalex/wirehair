@@ -36,6 +36,9 @@
 #include <linux/auxvec.h>
 #endif
 
+#include <atomic>
+#include <mutex>
+
 //------------------------------------------------------------------------------
 // Detect host byte order.
 // This check works with GCC and LLVM; assume little-endian byte order when
@@ -347,7 +350,9 @@ static void gf256_architecture_init()
 
 // Context object for GF(2^^8) math
 GF256_ALIGNED gf256_ctx GF256Ctx;
-static bool Initialized = false;
+static const int kInitNotRun = 1;
+static std::atomic<int> InitResult(kInitNotRun);
+static std::mutex InitMutex;
 
 
 //------------------------------------------------------------------------------
@@ -624,26 +629,36 @@ extern "C" int gf256_init_(int version)
     if (version != GF256_VERSION)
         return -1; // User's header does not match library version.
 
-    // Avoid multiple initialization
-    if (Initialized)
-        return 0;
-    Initialized = true;
+    const int cached = InitResult.load(std::memory_order_acquire);
+    if (cached != kInitNotRun) {
+        return cached;
+    }
 
-    if (!IsExpectedEndian())
-        return -2; // Unexpected byte order.
+    std::lock_guard<std::mutex> lock(InitMutex);
+    const int serializedCached = InitResult.load(std::memory_order_relaxed);
+    if (serializedCached != kInitNotRun) {
+        return serializedCached;
+    }
 
-    gf256_architecture_init();
-    gf256_poly_init(kDefaultPolynomialIndex);
-    gf256_explog_init();
-    gf256_muldiv_init();
-    gf256_inv_init();
-    gf256_sqr_init();
-    gf256_mul_mem_init();
+    int initResult = 0;
+    if (!IsExpectedEndian()) {
+        initResult = -2; // Unexpected byte order.
+    } else {
+        gf256_architecture_init();
+        gf256_poly_init(kDefaultPolynomialIndex);
+        gf256_explog_init();
+        gf256_muldiv_init();
+        gf256_inv_init();
+        gf256_sqr_init();
+        gf256_mul_mem_init();
 
-    if (!gf256_self_test())
-        return -3; // Self-test failed (perhaps untested configuration)
+        if (!gf256_self_test()) {
+            initResult = -3; // Self-test failed (perhaps untested configuration)
+        }
+    }
 
-    return 0;
+    InitResult.store(initResult, std::memory_order_release);
+    return initResult;
 }
 
 

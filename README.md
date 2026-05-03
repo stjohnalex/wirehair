@@ -27,19 +27,20 @@ into your project without any other external dependencies.
 
 To build the software in this repo:
 
-On Windows, make sure CMake and Git Bash are installed.  Open up git bash and then:
+On Windows, use Visual Studio 2022 with the Desktop C++ workload.
+Open `wirehair.sln` and build `Debug|x64` or `Release|x64`.
 
-~~~
-git clone git@github.com:catid/wirehair.git
-cd wirehair
-mkdir build
-cd build
-cmake .. -G "Visual Studio 16 2019"
-ls
-explorer .
-~~~
+CUDA support is provided through the `wirehair_cuda` project and benchmark
+variant projects in `msvc/`. For CUDA builds, install the Visual Studio CUDA
+build customization and a CUDA toolkit version supported by your local setup.
+The `wirehair_cuda.vcxproj` project now fails early with a clear error when
+CUDA BuildCustomizations are missing, so it cannot silently run CPU fallback.
 
-Then you can use Visual Studio Community Edition to open up the `wirehair.sln` file and build the software.
+For the checked-in MSVC solution (`wirehair.sln`), the UnitTest target now writes
+configuration-specific binaries to avoid file-lock collisions between Debug and Release:
+
+- `build/Debug/unit_test_Debug.exe`
+- `build/Release/unit_test_Release.exe`
 
 
 #### Example Usage
@@ -182,7 +183,8 @@ int main()
 Some quick comments:
 
 Benchmarks on my PC do not mean a whole lot.  Right now it's clocked at 3 GHz and has Turbo Boost on, etc.
-To run the test yourself just build and run the UnitTest project in Release mode.
+To run the test yourself just build and run the UnitTest project in Release mode
+(`build/Release/unit_test_Release.exe`).
 
 For small values of N < 128 or so this is a pretty inefficient codec compared to the Fecal codec.  Fecal is also a fountain code but is limited to repairing a small number of failures or small input block count.
 
