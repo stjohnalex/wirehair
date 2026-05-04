@@ -856,7 +856,17 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
     uint64_t neededSum = 0;
     uint64_t writeBatchCount = 0;
     uint64_t readBatchCount = 0;
-    const uint32_t writeBatchSymbols = highMemoryMode ? 384U : 128U;
+    uint32_t writeBatchSymbols = highMemoryMode ? 384U : 128U;
+    const char* writeBatchEnv = std::getenv(highMemoryMode
+        ? "WIREHAIR_STORAGE_WRITE_BATCH_HIGH"
+        : "WIREHAIR_STORAGE_WRITE_BATCH");
+    if (writeBatchEnv && writeBatchEnv[0] != '\0')
+    {
+        const unsigned long parsed = std::strtoul(writeBatchEnv, nullptr, 10);
+        if (parsed > 0UL) {
+            writeBatchSymbols = static_cast<uint32_t>(std::min<unsigned long>(4096UL, parsed));
+        }
+    }
     const uint32_t readBatchSymbols = highMemoryMode ? 384U : 128U;
     std::vector<double> writeLatencyMs;
     std::vector<double> readLatencyMs;
@@ -947,8 +957,8 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
             for (size_t i = 0; i < count; ++i)
             {
                 const uint32_t sourceIndex = shuffledWrite[start + i];
-                const std::streamoff offset = static_cast<std::streamoff>(sourceIndex) * blockBytes;
                 const uint64_t w0 = NowUs();
+                const std::streamoff offset = static_cast<std::streamoff>(sourceIndex) * blockBytes;
                 rw.seekp(offset, std::ios::beg);
                 rw.write(reinterpret_cast<const char*>(&encodedSlab[static_cast<size_t>(sourceIndex) * blockBytes]), blockBytes);
                 const uint64_t w1 = NowUs();
