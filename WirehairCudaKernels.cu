@@ -149,6 +149,17 @@ struct SessionStats
     std::atomic<uint64_t> KernelEventUs{0};
     std::atomic<uint64_t> D2hEventUs{0};
     std::atomic<uint64_t> E2eEventUs{0};
+    std::atomic<uint64_t> EnqueueUs{0};
+    std::atomic<uint64_t> QueueStallUs{0};
+    std::atomic<uint64_t> QueueDepthSamples{0};
+    std::atomic<uint64_t> QueueDepthTotal{0};
+    std::atomic<uint64_t> DeviceIdleUs{0};
+    std::atomic<uint64_t> SubmitBatches{0};
+    std::atomic<uint64_t> SubmitItems{0};
+    std::atomic<uint64_t> ProducerWaitUs{0};
+    std::atomic<uint64_t> TransferWaitUs{0};
+    std::atomic<uint64_t> ComputeWaitUs{0};
+    std::atomic<uint64_t> CompletionWaitUs{0};
     std::atomic<uint64_t> BytesH2d{0};
     std::atomic<uint64_t> BytesD2h{0};
 };
@@ -184,6 +195,7 @@ struct StreamContext
     cudaEvent_t D2hStopEvent = nullptr;
     cudaEvent_t E2eStartEvent = nullptr;
     cudaEvent_t E2eStopEvent = nullptr;
+    uint64_t LastCompletionUs = 0;
     bool EventInitialized = false;
     bool TimingEventsInitialized = false;
     bool Initialized = false;
@@ -524,14 +536,25 @@ bool WirehairCudaKernelProcessBatch(
         return false;
     }
 
-    const size_t totalBytes = static_cast<size_t>(params->item_count) * params->item_stride_bytes;
-    const uint64_t totalBytes64 = static_cast<uint64_t>(totalBytes);
     const uint32_t threadsPerBlock = 256;
-    const uint32_t blockCount = params->item_count;
+    const bool skipOutputCopy = ((params->options & WirehairCudaCoreBatchOption_SkipOutputCopy) != 0) ||
+        (params->op == WirehairCudaCoreOp_EncodeParity && outputData == inputData);
+    const bool skipChecksumCopy = (params->options & WirehairCudaCoreBatchOption_SkipChecksumCopy) != 0;
+    const bool copyOutput = outputData && !skipOutputCopy;
+    const uint8_t* hostIn = reinterpret_cast<const uint8_t*>(inputData);
+    uint8_t* hostOut = reinterpret_cast<uint8_t*>(outputData);
+    // Current encode preprocessing is a no-op when caller aliases input/output and
+    // does not request checksum materialization; avoid pointless kernel launches.
+    if (params->op == WirehairCudaCoreOp_EncodeParity && !copyOutput && skipChecksumCopy) {
+        std::memset(resultOut, 0, sizeof(WirehairCudaCoreBatchResult));
+        resultOut->struct_bytes = sizeof(WirehairCudaCoreBatchResult);
+        return true;
+    }
 
     int device = 0;
     bool usePinnedMemory = true;
-    uint32_t streamIndex = 0;
+    uint32_t activeStreams = 1;
+    uint32_t streamStart = 0;
     {
         std::lock_guard<std::mutex> lock(g_session.Mutex);
         device = g_session.DeviceOrdinal >= 0 ? g_session.DeviceOrdinal : 0;
@@ -539,156 +562,262 @@ bool WirehairCudaKernelProcessBatch(
         if (!EnsureSessionLocked(device) || !EnsureStreamPoolLocked()) {
             return false;
         }
-        streamIndex = AcquireStreamIndexLocked();
+        activeStreams = std::max<uint32_t>(1, g_session.ActiveStreamCount);
+        streamStart = AcquireStreamIndexLocked();
     }
-
-    StreamContext& ctx = g_streams[streamIndex];
-    std::lock_guard<std::mutex> streamLock(ctx.Mutex);
-    if (!CheckCuda(cudaSetDevice(device)) ||
-        !EnsureStreamContextInitialized(ctx) ||
-        !EnsureDeviceBufferLocked(ctx, totalBytes) ||
-        !EnsureChecksumBufferLocked(ctx, params->item_count) ||
-        !EnsurePinnedHostLocked(ctx, usePinnedMemory, totalBytes) ||
-        !EnsureCompletionEventLocked(ctx) ||
-        !EnsureTimingEventsLocked(ctx))
-    {
+    if (!CheckCuda(cudaSetDevice(device))) {
         return false;
     }
 
-    const uint8_t* hostIn = reinterpret_cast<const uint8_t*>(inputData);
-    uint8_t* hostOut = reinterpret_cast<uint8_t*>(outputData);
-    bool registeredIn = false;
-    bool registeredOut = false;
-    const bool allowHostRegister = (params->options & WirehairCudaCoreBatchOption_AllowHostRegister) != 0;
-    if (usePinnedMemory && allowHostRegister && totalBytes >= (64U * 1024U))
+    const uint32_t waveCount = std::max<uint32_t>(1, std::min<uint32_t>(activeStreams, params->item_count));
+    const uint32_t baseItemsPerWave = params->item_count / waveCount;
+    const uint32_t extraItems = params->item_count % waveCount;
+
+    struct WaveLaunch
     {
-        if (CheckCuda(cudaHostRegister(const_cast<uint8_t*>(hostIn), totalBytes, cudaHostRegisterPortable))) {
-            registeredIn = true;
+        StreamContext* Ctx = nullptr;
+        uint32_t ItemOffset = 0;
+        uint32_t ItemCount = 0;
+        size_t ByteCount = 0;
+        size_t H2dBytes = 0;
+        size_t D2hBytes = 0;
+        bool CopyOutput = false;
+        bool UseMappedInput = false;
+        bool RegisteredIn = false;
+        bool RegisteredOut = false;
+        const uint8_t* HostInPtr = nullptr;
+        uint8_t* HostOutPtr = nullptr;
+        const uint8_t* KernelInputPtr = nullptr;
+        uint8_t* KernelOutputPtr = nullptr;
+        uint32_t Checksum = 0;
+    };
+
+    std::vector<WaveLaunch> waves;
+    waves.reserve(waveCount);
+
+    uint32_t itemOffset = 0;
+    const uint64_t launchStartUs = ClockUs();
+    for (uint32_t wave = 0; wave < waveCount; ++wave)
+    {
+        const uint32_t waveItems = baseItemsPerWave + (wave < extraItems ? 1U : 0U);
+        if (waveItems == 0) {
+            continue;
         }
-        if (hostOut && hostOut != hostIn &&
-            CheckCuda(cudaHostRegister(hostOut, totalBytes, cudaHostRegisterPortable)))
+        const uint32_t streamIdx = (streamStart + wave) % activeStreams;
+        StreamContext& ctx = g_streams[streamIdx];
+        std::lock_guard<std::mutex> streamLock(ctx.Mutex);
+        if (!EnsureStreamContextInitialized(ctx) ||
+            !EnsureDeviceBufferLocked(ctx, static_cast<size_t>(waveItems) * params->item_stride_bytes) ||
+            !EnsureChecksumBufferLocked(ctx, waveItems) ||
+            !EnsurePinnedHostLocked(ctx, usePinnedMemory, static_cast<size_t>(waveItems) * params->item_stride_bytes) ||
+            !EnsureCompletionEventLocked(ctx) ||
+            !EnsureTimingEventsLocked(ctx))
         {
-            registeredOut = true;
-        }
-    }
-    struct HostRegistrationGuard
-    {
-        const uint8_t* In = nullptr;
-        uint8_t* Out = nullptr;
-        bool* InRegistered = nullptr;
-        bool* OutRegistered = nullptr;
-        ~HostRegistrationGuard()
-        {
-            if (InRegistered && *InRegistered && In) {
-                cudaHostUnregister(const_cast<uint8_t*>(In));
-            }
-            if (OutRegistered && *OutRegistered && Out) {
-                cudaHostUnregister(Out);
-            }
-        }
-    } hostRegGuard = {hostIn, hostOut, &registeredIn, &registeredOut};
-
-    const uint8_t* source = hostIn;
-    if (usePinnedMemory && !registeredIn && ctx.PinnedHost) {
-        std::memcpy(ctx.PinnedHost, hostIn, totalBytes);
-        source = ctx.PinnedHost;
-    }
-    const bool skipOutputCopy = ((params->options & WirehairCudaCoreBatchOption_SkipOutputCopy) != 0) ||
-        (params->op == WirehairCudaCoreOp_EncodeParity && outputData == inputData);
-    const bool copyOutput = hostOut && !skipOutputCopy;
-
-    if (!CheckCuda(cudaEventRecord(ctx.E2eStartEvent, ctx.Stream))) {
-        return false;
-    }
-
-    const uint64_t h2dStart = ClockUs();
-    if (!CheckCuda(cudaEventRecord(ctx.H2dStartEvent, ctx.Stream))) {
-        return false;
-    }
-    if (!CheckCuda(cudaMemcpyAsync(ctx.DeviceData, source, totalBytes, cudaMemcpyHostToDevice, ctx.Stream)) ||
-        !CheckCuda(cudaMemsetAsync(ctx.DeviceChecksums, 0, params->item_count * sizeof(uint32_t), ctx.Stream)))
-    {
-        return false;
-    }
-    if (!CheckCuda(cudaEventRecord(ctx.H2dStopEvent, ctx.Stream))) {
-        return false;
-    }
-    g_stats.H2dUs.fetch_add(ClockUs() - h2dStart, std::memory_order_relaxed);
-    g_stats.BytesH2d.fetch_add(totalBytes64, std::memory_order_relaxed);
-
-    const uint64_t kernelStart = ClockUs();
-    if (!CheckCuda(cudaEventRecord(ctx.KernelStartEvent, ctx.Stream))) {
-        return false;
-    }
-    if (params->op == WirehairCudaCoreOp_EncodeParity) {
-        WirehairBatchEncodeParityKernel<<<blockCount, threadsPerBlock, 0, ctx.Stream>>>(
-            ctx.DeviceData,
-            ctx.DeviceData,
-            params->item_stride_bytes,
-            params->item_bytes,
-            ctx.DeviceChecksums);
-        g_stats.EncodeCalls.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        WirehairBatchDecodeSolveKernel<<<blockCount, threadsPerBlock, 0, ctx.Stream>>>(
-            ctx.DeviceData,
-            params->item_stride_bytes,
-            params->item_bytes,
-            ctx.DeviceChecksums);
-        g_stats.DecodeCalls.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (!CheckCuda(cudaGetLastError())) {
-        return false;
-    }
-    if (!CheckCuda(cudaEventRecord(ctx.KernelStopEvent, ctx.Stream))) {
-        return false;
-    }
-    g_stats.KernelUs.fetch_add(ClockUs() - kernelStart, std::memory_order_relaxed);
-
-    uint32_t checksum = 0;
-    const uint64_t d2hStart = ClockUs();
-    if (!CheckCuda(cudaEventRecord(ctx.D2hStartEvent, ctx.Stream))) {
-        return false;
-    }
-    if (!CheckCuda(cudaMemcpyAsync(&checksum, ctx.DeviceChecksums, sizeof(uint32_t), cudaMemcpyDeviceToHost, ctx.Stream))) {
-        return false;
-    }
-    uint64_t bytesD2h = sizeof(uint32_t);
-    if (copyOutput) {
-        void* dest = hostOut;
-        if (usePinnedMemory && !registeredOut && ctx.PinnedHost) {
-            dest = ctx.PinnedHost;
-        }
-        if (!CheckCuda(cudaMemcpyAsync(dest, ctx.DeviceData, totalBytes, cudaMemcpyDeviceToHost, ctx.Stream))) {
             return false;
         }
-        bytesD2h += totalBytes64;
-    }
-    if (!CheckCuda(cudaEventRecord(ctx.D2hStopEvent, ctx.Stream)) ||
-        !CheckCuda(cudaEventRecord(ctx.E2eStopEvent, ctx.Stream)))
-    {
-        return false;
-    }
-    g_stats.D2hUs.fetch_add(ClockUs() - d2hStart, std::memory_order_relaxed);
-    g_stats.BytesD2h.fetch_add(bytesD2h, std::memory_order_relaxed);
 
-    const uint64_t syncStart = ClockUs();
-    if (!CheckCuda(cudaEventRecord(ctx.CompletionEvent, ctx.Stream)) ||
-        !CheckCuda(cudaEventSynchronize(ctx.CompletionEvent)))
+        WaveLaunch launch = {};
+        launch.Ctx = &ctx;
+        launch.ItemOffset = itemOffset;
+        launch.ItemCount = waveItems;
+        launch.ByteCount = static_cast<size_t>(waveItems) * params->item_stride_bytes;
+        launch.CopyOutput = copyOutput;
+        launch.HostInPtr = hostIn + static_cast<size_t>(itemOffset) * params->item_stride_bytes;
+        launch.HostOutPtr = copyOutput ? (hostOut + static_cast<size_t>(itemOffset) * params->item_stride_bytes) : nullptr;
+        launch.KernelInputPtr = ctx.DeviceData;
+        launch.KernelOutputPtr = ctx.DeviceData;
+
+        waves.push_back(launch);
+        WaveLaunch& queued = waves.back();
+
+        const bool allowHostRegister = (params->options & WirehairCudaCoreBatchOption_AllowHostRegister) != 0;
+        if (usePinnedMemory && allowHostRegister && queued.ByteCount >= (1024U * 1024U))
+        {
+            if (CheckCuda(cudaHostRegister(const_cast<uint8_t*>(queued.HostInPtr), queued.ByteCount, cudaHostRegisterPortable))) {
+                queued.RegisteredIn = true;
+            }
+            if (queued.CopyOutput && queued.HostOutPtr &&
+                CheckCuda(cudaHostRegister(queued.HostOutPtr, queued.ByteCount, cudaHostRegisterPortable)))
+            {
+                queued.RegisteredOut = true;
+            }
+        }
+
+        const uint8_t* source = queued.HostInPtr;
+        if (queued.RegisteredIn)
+        {
+            uint8_t* mappedIn = nullptr;
+            if (CheckCuda(cudaHostGetDevicePointer(&mappedIn, const_cast<uint8_t*>(queued.HostInPtr), 0)))
+            {
+                queued.KernelInputPtr = mappedIn;
+                if (!queued.CopyOutput) {
+                    queued.KernelOutputPtr = mappedIn;
+                    queued.UseMappedInput = true;
+                } else if (queued.HostOutPtr && queued.RegisteredOut) {
+                    uint8_t* mappedOut = nullptr;
+                    if (CheckCuda(cudaHostGetDevicePointer(&mappedOut, queued.HostOutPtr, 0))) {
+                        queued.KernelOutputPtr = mappedOut;
+                        queued.UseMappedInput = true;
+                    }
+                }
+            }
+        }
+        if (usePinnedMemory && !queued.RegisteredIn && ctx.PinnedHost) {
+            std::memcpy(ctx.PinnedHost, queued.HostInPtr, queued.ByteCount);
+            source = ctx.PinnedHost;
+        }
+
+        const uint64_t nowUs = ClockUs();
+        // Track device idle gaps only when they occur inside one launch window.
+        // This avoids counting unrelated host-side think time between API calls.
+        if (ctx.LastCompletionUs != 0 &&
+            ctx.LastCompletionUs >= launchStartUs &&
+            nowUs > ctx.LastCompletionUs)
+        {
+            g_stats.DeviceIdleUs.fetch_add(nowUs - ctx.LastCompletionUs, std::memory_order_relaxed);
+        }
+        if (!CheckCuda(cudaEventRecord(ctx.E2eStartEvent, ctx.Stream)) ||
+            !CheckCuda(cudaEventRecord(ctx.H2dStartEvent, ctx.Stream)))
+        {
+            return false;
+        }
+        if (!queued.UseMappedInput)
+        {
+            if (!CheckCuda(cudaMemcpyAsync(ctx.DeviceData, source, queued.ByteCount, cudaMemcpyHostToDevice, ctx.Stream)))
+            {
+                return false;
+            }
+            queued.H2dBytes += queued.ByteCount;
+        }
+        if (!CheckCuda(cudaMemsetAsync(ctx.DeviceChecksums, 0, queued.ItemCount * sizeof(uint32_t), ctx.Stream)) ||
+            !CheckCuda(cudaEventRecord(ctx.H2dStopEvent, ctx.Stream)) ||
+            !CheckCuda(cudaEventRecord(ctx.KernelStartEvent, ctx.Stream)))
+        {
+            return false;
+        }
+
+        if (params->op == WirehairCudaCoreOp_EncodeParity) {
+            WirehairBatchEncodeParityKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelInputPtr,
+                queued.KernelOutputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            g_stats.EncodeCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            WirehairBatchDecodeSolveKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                ctx.DeviceData,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            g_stats.DecodeCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!CheckCuda(cudaGetLastError()) ||
+            !CheckCuda(cudaEventRecord(ctx.KernelStopEvent, ctx.Stream)) ||
+            !CheckCuda(cudaEventRecord(ctx.D2hStartEvent, ctx.Stream)))
+        {
+            return false;
+        }
+        if (!skipChecksumCopy &&
+            !CheckCuda(cudaMemcpyAsync(&queued.Checksum, ctx.DeviceChecksums, sizeof(uint32_t), cudaMemcpyDeviceToHost, ctx.Stream)))
+        {
+            return false;
+        }
+        if (!skipChecksumCopy) {
+            queued.D2hBytes += sizeof(uint32_t);
+        }
+        if (queued.CopyOutput) {
+            void* dest = queued.HostOutPtr;
+            if (usePinnedMemory && !queued.RegisteredOut && ctx.PinnedHost) {
+                dest = ctx.PinnedHost;
+            }
+            if (!queued.UseMappedInput)
+            {
+                if (!CheckCuda(cudaMemcpyAsync(dest, ctx.DeviceData, queued.ByteCount, cudaMemcpyDeviceToHost, ctx.Stream))) {
+                    return false;
+                }
+                queued.D2hBytes += queued.ByteCount;
+            }
+        }
+        if (!CheckCuda(cudaEventRecord(ctx.D2hStopEvent, ctx.Stream)) ||
+            !CheckCuda(cudaEventRecord(ctx.E2eStopEvent, ctx.Stream)) ||
+            !CheckCuda(cudaEventRecord(ctx.CompletionEvent, ctx.Stream)))
+        {
+            return false;
+        }
+        itemOffset += waveItems;
+    }
+
+    g_stats.EnqueueUs.fetch_add(ClockUs() - launchStartUs, std::memory_order_relaxed);
+    g_stats.ProducerWaitUs.fetch_add(ClockUs() - launchStartUs, std::memory_order_relaxed);
+    g_stats.QueueDepthSamples.fetch_add(1, std::memory_order_relaxed);
+    g_stats.QueueDepthTotal.fetch_add(waves.size(), std::memory_order_relaxed);
+    g_stats.SubmitBatches.fetch_add(waves.size(), std::memory_order_relaxed);
+    g_stats.SubmitItems.fetch_add(params->item_count, std::memory_order_relaxed);
+    uint64_t totalH2dBytes = 0;
+    uint64_t totalD2hBytes = 0;
+    for (size_t i = 0; i < waves.size(); ++i) {
+        totalH2dBytes += static_cast<uint64_t>(waves[i].H2dBytes);
+        totalD2hBytes += static_cast<uint64_t>(waves[i].D2hBytes);
+    }
+    g_stats.BytesH2d.fetch_add(totalH2dBytes, std::memory_order_relaxed);
+    g_stats.BytesD2h.fetch_add(totalD2hBytes, std::memory_order_relaxed);
+
+    uint64_t syncStartUs = ClockUs();
+    uint64_t stallUs = 0;
+    uint32_t mergedChecksum = 0;
+    uint64_t totalTransferWaitUs = 0;
+    uint64_t totalComputeWaitUs = 0;
+    uint64_t totalCompletionWaitUs = 0;
+    for (size_t i = 0; i < waves.size(); ++i)
     {
-        return false;
+        WaveLaunch& launch = waves[i];
+        StreamContext& ctx = *launch.Ctx;
+        std::lock_guard<std::mutex> streamLock(ctx.Mutex);
+        const uint64_t waitStartUs = ClockUs();
+        if (!CheckCuda(cudaEventSynchronize(ctx.CompletionEvent))) {
+            return false;
+        }
+        const uint64_t waitUs = ClockUs() - waitStartUs;
+        stallUs += waitUs;
+        ctx.LastCompletionUs = ClockUs();
+        mergedChecksum ^= launch.Checksum;
+
+        const uint64_t h2dEventUs = EventElapsedUs(ctx.H2dStartEvent, ctx.H2dStopEvent);
+        const uint64_t kernelEventUs = EventElapsedUs(ctx.KernelStartEvent, ctx.KernelStopEvent);
+        const uint64_t d2hEventUs = EventElapsedUs(ctx.D2hStartEvent, ctx.D2hStopEvent);
+        const uint64_t e2eEventUs = EventElapsedUs(ctx.E2eStartEvent, ctx.E2eStopEvent);
+        g_stats.H2dEventUs.fetch_add(h2dEventUs, std::memory_order_relaxed);
+        g_stats.KernelEventUs.fetch_add(kernelEventUs, std::memory_order_relaxed);
+        g_stats.D2hEventUs.fetch_add(d2hEventUs, std::memory_order_relaxed);
+        g_stats.E2eEventUs.fetch_add(e2eEventUs, std::memory_order_relaxed);
+        g_stats.H2dUs.fetch_add(h2dEventUs, std::memory_order_relaxed);
+        g_stats.KernelUs.fetch_add(kernelEventUs, std::memory_order_relaxed);
+        g_stats.D2hUs.fetch_add(d2hEventUs, std::memory_order_relaxed);
+        totalTransferWaitUs += h2dEventUs + d2hEventUs;
+        totalComputeWaitUs += kernelEventUs;
+        totalCompletionWaitUs += waitUs;
+        if (launch.CopyOutput && usePinnedMemory && !launch.RegisteredOut && ctx.PinnedHost) {
+            std::memcpy(launch.HostOutPtr, ctx.PinnedHost, launch.ByteCount);
+        }
+        if (launch.RegisteredIn) {
+            cudaHostUnregister(const_cast<uint8_t*>(launch.HostInPtr));
+        }
+        if (launch.RegisteredOut && launch.HostOutPtr) {
+            cudaHostUnregister(launch.HostOutPtr);
+        }
     }
-    g_stats.SyncUs.fetch_add(ClockUs() - syncStart, std::memory_order_relaxed);
-    g_stats.H2dEventUs.fetch_add(EventElapsedUs(ctx.H2dStartEvent, ctx.H2dStopEvent), std::memory_order_relaxed);
-    g_stats.KernelEventUs.fetch_add(EventElapsedUs(ctx.KernelStartEvent, ctx.KernelStopEvent), std::memory_order_relaxed);
-    g_stats.D2hEventUs.fetch_add(EventElapsedUs(ctx.D2hStartEvent, ctx.D2hStopEvent), std::memory_order_relaxed);
-    g_stats.E2eEventUs.fetch_add(EventElapsedUs(ctx.E2eStartEvent, ctx.E2eStopEvent), std::memory_order_relaxed);
-    if (copyOutput && usePinnedMemory && !registeredOut && ctx.PinnedHost) {
-        std::memcpy(hostOut, ctx.PinnedHost, totalBytes);
-    }
+
+    g_stats.SyncUs.fetch_add(ClockUs() - syncStartUs, std::memory_order_relaxed);
+    g_stats.QueueStallUs.fetch_add(stallUs, std::memory_order_relaxed);
+    g_stats.TransferWaitUs.fetch_add(totalTransferWaitUs, std::memory_order_relaxed);
+    g_stats.ComputeWaitUs.fetch_add(totalComputeWaitUs, std::memory_order_relaxed);
+    g_stats.CompletionWaitUs.fetch_add(totalCompletionWaitUs, std::memory_order_relaxed);
+
     std::memset(resultOut, 0, sizeof(WirehairCudaCoreBatchResult));
     resultOut->struct_bytes = sizeof(WirehairCudaCoreBatchResult);
     resultOut->processed_count = params->item_count;
-    resultOut->checksum = checksum;
+    resultOut->checksum = mergedChecksum;
     return true;
 }
 
@@ -705,6 +834,17 @@ void WirehairCudaKernelResetStats()
     g_stats.KernelEventUs.store(0, std::memory_order_relaxed);
     g_stats.D2hEventUs.store(0, std::memory_order_relaxed);
     g_stats.E2eEventUs.store(0, std::memory_order_relaxed);
+    g_stats.EnqueueUs.store(0, std::memory_order_relaxed);
+    g_stats.QueueStallUs.store(0, std::memory_order_relaxed);
+    g_stats.QueueDepthSamples.store(0, std::memory_order_relaxed);
+    g_stats.QueueDepthTotal.store(0, std::memory_order_relaxed);
+    g_stats.DeviceIdleUs.store(0, std::memory_order_relaxed);
+    g_stats.SubmitBatches.store(0, std::memory_order_relaxed);
+    g_stats.SubmitItems.store(0, std::memory_order_relaxed);
+    g_stats.ProducerWaitUs.store(0, std::memory_order_relaxed);
+    g_stats.TransferWaitUs.store(0, std::memory_order_relaxed);
+    g_stats.ComputeWaitUs.store(0, std::memory_order_relaxed);
+    g_stats.CompletionWaitUs.store(0, std::memory_order_relaxed);
     g_stats.BytesH2d.store(0, std::memory_order_relaxed);
     g_stats.BytesD2h.store(0, std::memory_order_relaxed);
 }
@@ -725,6 +865,17 @@ bool WirehairCudaKernelGetStats(WirehairCudaKernelStats* statsOut)
     statsOut->kernel_event_us = g_stats.KernelEventUs.load(std::memory_order_relaxed);
     statsOut->d2h_event_us = g_stats.D2hEventUs.load(std::memory_order_relaxed);
     statsOut->e2e_event_us = g_stats.E2eEventUs.load(std::memory_order_relaxed);
+    statsOut->enqueue_us = g_stats.EnqueueUs.load(std::memory_order_relaxed);
+    statsOut->queue_stall_us = g_stats.QueueStallUs.load(std::memory_order_relaxed);
+    statsOut->queue_depth_samples = g_stats.QueueDepthSamples.load(std::memory_order_relaxed);
+    statsOut->queue_depth_total = g_stats.QueueDepthTotal.load(std::memory_order_relaxed);
+    statsOut->device_idle_us = g_stats.DeviceIdleUs.load(std::memory_order_relaxed);
+    statsOut->submit_batches = g_stats.SubmitBatches.load(std::memory_order_relaxed);
+    statsOut->submit_items = g_stats.SubmitItems.load(std::memory_order_relaxed);
+    statsOut->producer_wait_us = g_stats.ProducerWaitUs.load(std::memory_order_relaxed);
+    statsOut->transfer_wait_us = g_stats.TransferWaitUs.load(std::memory_order_relaxed);
+    statsOut->compute_wait_us = g_stats.ComputeWaitUs.load(std::memory_order_relaxed);
+    statsOut->completion_wait_us = g_stats.CompletionWaitUs.load(std::memory_order_relaxed);
     statsOut->bytes_h2d = g_stats.BytesH2d.load(std::memory_order_relaxed);
     statsOut->bytes_d2h = g_stats.BytesD2h.load(std::memory_order_relaxed);
     return true;

@@ -45,6 +45,12 @@
     <IntDir>$(ProjectDir)..\build\intermediate\$(Configuration)\$(ProjectName)\</IntDir>
     <TargetName>ab_benchmark_cuda_$(Configuration)</TargetName>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LocalDebuggerCommandArguments>--output "$(OutDir)ab-bench\ab-benchmark.json" --io-root "$(OutDir)ab-bench\io" --trials 2 --stress 0 --core-use-cuda-batch 1 --cuda-high-memory 1 --cuda-backend cudaprefer</LocalDebuggerCommandArguments>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LocalDebuggerCommandArguments>--output "$(OutDir)ab-bench\ab-benchmark.json" --io-root "$(OutDir)ab-bench\io" --trials 2 --stress 0 --core-use-cuda-batch 1 --cuda-high-memory 1 --cuda-backend cudaprefer</LocalDebuggerCommandArguments>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>

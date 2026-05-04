@@ -33,6 +33,8 @@ struct Config
     uint32_t MinTrials = 8;
     uint32_t CampaignSeconds = 900;
     uint64_t Seed = 0x1234abcd9876ULL;
+    bool LockVariantSeed = true;
+    std::string CampaignProfile = "mixed-random-balanced";
     /** Pass --require-cuda-* thresholds to BenchmarkCompareReport.py (exit 3 if CUDA loses). */
     bool EnforceCudaGates = false;
 };
@@ -150,6 +152,14 @@ static bool ParseArgs(int argc, char** argv, Config& cfg)
                 return false;
             }
             cfg.Seed = static_cast<uint64_t>(parsed);
+        } else if (arg == "--lock-variant-seed") {
+            cfg.LockVariantSeed = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
+        } else if (arg == "--campaign-profile") {
+            if (val != "mixed-random-balanced" && val != "cuda-heavy-random") {
+                std::cerr << "Unknown --campaign-profile value: " << val << std::endl;
+                return false;
+            }
+            cfg.CampaignProfile = val;
         } else {
             std::cerr << "Unknown arg: " << arg << std::endl;
             return false;
@@ -344,9 +354,10 @@ static double RunVariantAndMeasureSeconds(
     const VariantSpec& variant,
     const std::string& ioRoot,
     uint32_t trials,
-    uint64_t seed)
+    uint64_t seed,
+    const Config& cfg)
 {
-    const std::vector<std::string> args = {
+    std::vector<std::string> args = {
         "--output",
         variant.OutputJson,
         "--io-root",
@@ -360,6 +371,20 @@ static double RunVariantAndMeasureSeconds(
         "--seed",
         std::to_string(seed),
     };
+    if (cfg.CampaignProfile == "mixed-random-balanced") {
+        args.push_back("--cuda-high-memory");
+        args.push_back("0");
+    } else {
+        args.push_back("--cuda-high-memory");
+        args.push_back("1");
+    }
+    if (variant.Label == "cuda")
+    {
+        args.push_back("--core-use-cuda-batch");
+        args.push_back("1");
+        args.push_back("--cuda-backend");
+        args.push_back("cudaprefer");
+    }
 
     const auto begin = std::chrono::steady_clock::now();
     const int code = RunProcess(variant.ExePath, args, false);
@@ -380,7 +405,8 @@ int main(int argc, char** argv)
             << "Wirehair benchmark suite — runs all variant exes and prints a console comparison.\n"
             << "Usage:\n"
             << "  ab_benchmark_compare [--output-dir <dir>] [--trials <n>] [--min-trials <n>]\n"
-            << "                      [--campaign-seconds <sec>] [--seed <u64>] [--enforce-cuda-gates]\n"
+            << "                      [--campaign-seconds <sec>] [--seed <u64>] [--lock-variant-seed <0|1>]\n"
+            << "                      [--campaign-profile <mixed-random-balanced|cuda-heavy-random>] [--enforce-cuda-gates]\n"
             << "  Runs variants in --quiet 1 --stress 1 mode by default.\n"
             << "  --trials 0 calibrates trial count from --campaign-seconds (default 900).\n"
             << "  --enforce-cuda-gates  optional CI mode: Python exits 3 if CUDA is below thresholds vs control.\n"
@@ -457,11 +483,18 @@ int main(int argc, char** argv)
         {
             VariantSpec calibrationVariant = variants[i];
             calibrationVariant.OutputJson = JoinPath(calibrationDir, variants[i].Label + ".json");
+            const std::string calibrationVariantIoRoot = JoinPath(calibrationIoRoot, variants[i].Label);
+            if (!EnsureDirectory(calibrationVariantIoRoot)) {
+                std::cerr << "Failed to create calibration io dir: " << calibrationVariantIoRoot << std::endl;
+                return 5;
+            }
+            const uint64_t runSeed = cfg.LockVariantSeed ? cfg.Seed : (cfg.Seed + static_cast<uint64_t>(i));
             const double seconds = RunVariantAndMeasureSeconds(
                 calibrationVariant,
-                calibrationIoRoot,
+                calibrationVariantIoRoot,
                 1,
-                cfg.Seed + static_cast<uint64_t>(i));
+                runSeed,
+                cfg);
             if (seconds <= 0.0) {
                 return 5;
             }
@@ -484,11 +517,18 @@ int main(int argc, char** argv)
 
     for (size_t i = 0; i < variants.size(); ++i)
     {
+        const std::string variantIoRoot = JoinPath(ioRoot, variants[i].Label);
+        if (!EnsureDirectory(variantIoRoot)) {
+            std::cerr << "Failed to create io dir for " << variants[i].Label << ": " << variantIoRoot << std::endl;
+            return static_cast<int>(6 + i);
+        }
+        const uint64_t runSeed = cfg.LockVariantSeed ? cfg.Seed : (cfg.Seed + static_cast<uint64_t>(i));
         const double seconds = RunVariantAndMeasureSeconds(
             variants[i],
-            ioRoot,
+            variantIoRoot,
             chosenTrials,
-            cfg.Seed + static_cast<uint64_t>(i));
+            runSeed,
+            cfg);
         if (seconds <= 0.0) {
             return static_cast<int>(6 + i);
         }
@@ -521,9 +561,25 @@ int main(int argc, char** argv)
             pyArgs.push_back("--require-cuda-stress-decode-min-delta");
             pyArgs.push_back("-10.0");
             pyArgs.push_back("--require-cuda-kernel-share-pct");
-            pyArgs.push_back("18.0");
+            pyArgs.push_back("20.0");
             pyArgs.push_back("--require-cuda-core-offload-calls");
             pyArgs.push_back("24");
+            pyArgs.push_back("--require-cuda-min-queue-depth");
+            pyArgs.push_back("1.25");
+            pyArgs.push_back("--require-cuda-max-device-idle-pct");
+            pyArgs.push_back("85.0");
+            pyArgs.push_back("--require-cuda-min-symbols-per-submit");
+            pyArgs.push_back("64.0");
+            pyArgs.push_back("--require-cuda-min-overlap-ratio");
+            pyArgs.push_back("0.90");
+            pyArgs.push_back("--require-cuda-random-read-delta");
+            pyArgs.push_back("-5.0");
+            pyArgs.push_back("--require-cuda-random-write-delta");
+            pyArgs.push_back("-5.0");
+            pyArgs.push_back("--require-cuda-random-read-p95-ms");
+            pyArgs.push_back("25.0");
+            pyArgs.push_back("--require-cuda-random-write-p95-ms");
+            pyArgs.push_back("25.0");
         }
     }
     pyArgs.push_back("--out");

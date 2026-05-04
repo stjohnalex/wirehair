@@ -16,6 +16,17 @@ struct WirehairCudaKernelStats
     uint64_t kernel_event_us;
     uint64_t d2h_event_us;
     uint64_t e2e_event_us;
+    uint64_t enqueue_us;
+    uint64_t queue_stall_us;
+    uint64_t queue_depth_samples;
+    uint64_t queue_depth_total;
+    uint64_t device_idle_us;
+    uint64_t submit_batches;
+    uint64_t submit_items;
+    uint64_t producer_wait_us;
+    uint64_t transfer_wait_us;
+    uint64_t compute_wait_us;
+    uint64_t completion_wait_us;
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
 };
@@ -42,6 +53,7 @@ enum WirehairCudaCoreBatchOption : uint32_t
     WirehairCudaCoreBatchOption_None = 0,
     WirehairCudaCoreBatchOption_AllowHostRegister = 1 << 0,
     WirehairCudaCoreBatchOption_SkipOutputCopy = 1 << 1,
+    WirehairCudaCoreBatchOption_SkipChecksumCopy = 1 << 2,
 };
 
 struct WirehairCudaCoreBatchResult

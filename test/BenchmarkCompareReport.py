@@ -166,6 +166,14 @@ def build_variant_report(control: Dict, variant_label: str, variant_data: Dict) 
             "control": float(c_storage.get("success_rate", 0.0)),
             "variant": float(v_storage.get("success_rate", 0.0)),
         },
+        "random_read_p95_ms": {
+            "control": float(c_storage.get("random_read_p95_ms", 0.0)),
+            "variant": float(v_storage.get("random_read_p95_ms", 0.0)),
+        },
+        "random_write_p95_ms": {
+            "control": float(c_storage.get("random_write_p95_ms", 0.0)),
+            "variant": float(v_storage.get("random_write_p95_ms", 0.0)),
+        },
     }
     for metric in storage.values():
         metric["delta_pct"] = pct_delta(metric["control"], metric["variant"])
@@ -178,6 +186,8 @@ def build_variant_report(control: Dict, variant_label: str, variant_data: Dict) 
         "churn_success_rate_avg_delta_pct": summarize_delta(churn_rows, "success_rate"),
         "storage_write_mbps_delta_pct": storage["write_mbps"]["delta_pct"],
         "storage_read_mbps_delta_pct": storage["read_mbps"]["delta_pct"],
+        "storage_random_read_p95_delta_pct": storage["random_read_p95_ms"]["delta_pct"],
+        "storage_random_write_p95_delta_pct": storage["random_write_p95_ms"]["delta_pct"],
     }
 
     control_scaling = {int(x.get("threads", 0)): x for x in control.get("thread_scaling", [])}
@@ -214,6 +224,7 @@ def build_variant_report(control: Dict, variant_label: str, variant_data: Dict) 
         "parity": parity_rows,
         "churn": churn_rows,
         "storage": storage,
+        "storage_mode_profile": str(v_storage.get("mode_profile", "balanced")),
         "thread_scaling": scaling_rows,
         "summary": summary,
         "win_score": win_score,
@@ -234,6 +245,11 @@ def print_variant_summary(report: Dict) -> None:
         f"  storage write={summary['storage_write_mbps_delta_pct']:.2f}% "
         f"read={summary['storage_read_mbps_delta_pct']:.2f}%"
     )
+    print(
+        f"  storage random p95 read={summary['storage_random_read_p95_delta_pct']:.2f}% "
+        f"write={summary['storage_random_write_p95_delta_pct']:.2f}% (lower is better)"
+    )
+    print(f"  storage mode_profile={report.get('storage_mode_profile', 'balanced')}")
     print(
         f"  parity success={summary['parity_success_rate_avg_delta_pct']:.2f}% "
         f"churn success={summary['churn_success_rate_avg_delta_pct']:.2f}%"
@@ -264,7 +280,12 @@ def print_variant_summary(report: Dict) -> None:
             f"offload_calls={int(cuda_perf.get('core_offload_calls', 0))} "
             f"kernel_share_pct={float(cuda_perf.get('kernel_share_pct', 0.0)):.2f} "
             f"transfer_sync_share_pct={float(cuda_perf.get('transfer_sync_share_pct', 0.0)):.2f} "
-            f"avg_bytes_per_call={float(cuda_perf.get('avg_bytes_per_call', 0.0)):.2f}"
+            f"avg_bytes_per_call={float(cuda_perf.get('avg_bytes_per_call', 0.0)):.2f} "
+            f"avg_queue_depth={float(cuda_perf.get('avg_queue_depth', 0.0)):.2f} "
+            f"queue_stall_pct={float(cuda_perf.get('queue_stall_pct', 0.0)):.2f} "
+            f"device_idle_pct={float(cuda_perf.get('device_idle_pct', 0.0)):.2f} "
+            f"symbols_per_submit={float(cuda_perf.get('symbols_per_submit', 0.0)):.2f} "
+            f"overlap_ratio={float(cuda_perf.get('overlap_ratio', 0.0)):.2f}"
         )
 
 
@@ -390,6 +411,54 @@ def main() -> int:
         default=None,
         help="If set, fail unless CUDA core_offload_calls >= this value.",
     )
+    parser.add_argument(
+        "--require-cuda-min-queue-depth",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA avg_queue_depth >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-max-device-idle-pct",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA device_idle_pct <= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-min-symbols-per-submit",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA symbols_per_submit >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-min-overlap-ratio",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA overlap_ratio >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-random-read-delta",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA storage read MB/s delta vs control >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-random-write-delta",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA storage write MB/s delta vs control >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-random-read-p95-ms",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA random read p95 latency <= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-random-write-p95-ms",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA random write p95 latency <= this value.",
+    )
     args = parser.parse_args()
 
     if not args.variant:
@@ -487,7 +556,12 @@ def main() -> int:
             )
             return 3
 
-    if args.require_cuda_kernel_share_pct is not None or args.require_cuda_core_offload_calls is not None:
+    if (args.require_cuda_kernel_share_pct is not None or
+            args.require_cuda_core_offload_calls is not None or
+            args.require_cuda_min_queue_depth is not None or
+            args.require_cuda_max_device_idle_pct is not None or
+            args.require_cuda_min_symbols_per_submit is not None or
+            args.require_cuda_min_overlap_ratio is not None):
         cuda_entry = next((x for x in variant_reports if x.get("label") == "cuda"), None)
         if cuda_entry is None:
             print("CUDA utilization gate requested but no cuda variant was supplied.")
@@ -495,6 +569,10 @@ def main() -> int:
         cuda_perf = cuda_entry.get("cuda_perf", {})
         kernel_share = float(cuda_perf.get("kernel_share_pct", 0.0))
         offload_calls = float(cuda_perf.get("core_offload_calls", 0.0))
+        avg_queue_depth = float(cuda_perf.get("avg_queue_depth", 0.0))
+        device_idle_pct = float(cuda_perf.get("device_idle_pct", 0.0))
+        symbols_per_submit = float(cuda_perf.get("symbols_per_submit", 0.0))
+        overlap_ratio = float(cuda_perf.get("overlap_ratio", 0.0))
         if args.require_cuda_kernel_share_pct is not None and kernel_share < args.require_cuda_kernel_share_pct:
             print(
                 f"CUDA kernel share gate failed: {kernel_share:.2f}% "
@@ -505,6 +583,61 @@ def main() -> int:
             print(
                 f"CUDA offload call gate failed: {offload_calls:.0f} "
                 f"< required {args.require_cuda_core_offload_calls:.0f}"
+            )
+            return 3
+        if args.require_cuda_min_queue_depth is not None and avg_queue_depth < args.require_cuda_min_queue_depth:
+            print(
+                f"CUDA queue depth gate failed: {avg_queue_depth:.2f} "
+                f"< required {args.require_cuda_min_queue_depth:.2f}"
+            )
+            return 3
+        if args.require_cuda_max_device_idle_pct is not None and device_idle_pct > args.require_cuda_max_device_idle_pct:
+            print(
+                f"CUDA device idle gate failed: {device_idle_pct:.2f}% "
+                f"> required {args.require_cuda_max_device_idle_pct:.2f}%"
+            )
+            return 3
+        if args.require_cuda_min_symbols_per_submit is not None and symbols_per_submit < args.require_cuda_min_symbols_per_submit:
+            print(
+                f"CUDA symbols-per-submit gate failed: {symbols_per_submit:.2f} "
+                f"< required {args.require_cuda_min_symbols_per_submit:.2f}"
+            )
+            return 3
+        if args.require_cuda_min_overlap_ratio is not None and overlap_ratio < args.require_cuda_min_overlap_ratio:
+            print(
+                f"CUDA overlap-ratio gate failed: {overlap_ratio:.2f} "
+                f"< required {args.require_cuda_min_overlap_ratio:.2f}"
+            )
+            return 3
+        if args.require_cuda_random_read_delta is not None:
+            random_read_delta = float(cuda_entry["summary"].get("storage_read_mbps_delta_pct", 0.0))
+            if random_read_delta < args.require_cuda_random_read_delta:
+                print(
+                    f"CUDA random read delta gate failed: {random_read_delta:.2f}% "
+                    f"< required {args.require_cuda_random_read_delta:.2f}%"
+                )
+                return 3
+        if args.require_cuda_random_write_delta is not None:
+            random_write_delta = float(cuda_entry["summary"].get("storage_write_mbps_delta_pct", 0.0))
+            if random_write_delta < args.require_cuda_random_write_delta:
+                print(
+                    f"CUDA random write delta gate failed: {random_write_delta:.2f}% "
+                    f"< required {args.require_cuda_random_write_delta:.2f}%"
+                )
+                return 3
+        storage_payload = cuda_entry.get("storage", {})
+        cuda_random_read_p95 = float(storage_payload.get("random_read_p95_ms", {}).get("variant", 0.0))
+        cuda_random_write_p95 = float(storage_payload.get("random_write_p95_ms", {}).get("variant", 0.0))
+        if args.require_cuda_random_read_p95_ms is not None and cuda_random_read_p95 > args.require_cuda_random_read_p95_ms:
+            print(
+                f"CUDA random read p95 gate failed: {cuda_random_read_p95:.2f}ms "
+                f"> required {args.require_cuda_random_read_p95_ms:.2f}ms"
+            )
+            return 3
+        if args.require_cuda_random_write_p95_ms is not None and cuda_random_write_p95 > args.require_cuda_random_write_p95_ms:
+            print(
+                f"CUDA random write p95 gate failed: {cuda_random_write_p95:.2f}ms "
+                f"> required {args.require_cuda_random_write_p95_ms:.2f}ms"
             )
             return 3
 

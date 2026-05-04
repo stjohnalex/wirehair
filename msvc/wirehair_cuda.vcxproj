@@ -84,13 +84,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="LocalDebuggerSettings">
     <LocalDebuggerCommand>$(OutDir)ab_benchmark_cuda_Debug.exe</LocalDebuggerCommand>
     <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
-    <LocalDebuggerCommandArguments>--output "$(OutDir)cuda_smoke.json" --io-root "$(OutDir)cuda_smoke_io" --trials 1 --seed 1</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArguments>--output "$(OutDir)cuda_smoke.json" --io-root "$(OutDir)cuda_smoke_io" --trials 1 --seed 1 --core-use-cuda-batch 1 --cuda-high-memory 1 --cuda-backend cudaprefer</LocalDebuggerCommandArguments>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="LocalDebuggerSettings">
     <LocalDebuggerCommand>$(OutDir)ab_benchmark_cuda_Release.exe</LocalDebuggerCommand>
     <LocalDebuggerWorkingDirectory>$(OutDir)</LocalDebuggerWorkingDirectory>
-    <LocalDebuggerCommandArguments>--output "$(OutDir)cuda_smoke.json" --io-root "$(OutDir)cuda_smoke_io" --trials 1 --seed 1</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArguments>--output "$(OutDir)cuda_smoke.json" --io-root "$(OutDir)cuda_smoke_io" --trials 1 --seed 1 --core-use-cuda-batch 1 --cuda-high-memory 1 --cuda-backend cudaprefer</LocalDebuggerCommandArguments>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">

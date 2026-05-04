@@ -2,7 +2,9 @@
 
 #include "WirehairCodec.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -23,6 +25,7 @@ enum WirehairCudaCoreBatchOption : uint32_t
     WirehairCudaCoreBatchOption_None = 0,
     WirehairCudaCoreBatchOption_AllowHostRegister = 1 << 0,
     WirehairCudaCoreBatchOption_SkipOutputCopy = 1 << 1,
+    WirehairCudaCoreBatchOption_SkipChecksumCopy = 1 << 2,
 };
 
 struct WirehairCudaCoreBatchParams
@@ -51,12 +54,12 @@ std::atomic<uint32_t> g_streamCount(1);
 std::atomic<uint32_t> g_usePinnedMemory(1);
 std::atomic<int32_t> g_cudaReadyState(0); // 0 unknown, 1 ready, -1 unavailable
 std::atomic<int32_t> g_cudaReadyOrdinal((std::numeric_limits<int32_t>::min)());
-std::atomic<uint32_t> g_dynamicOffloadEncodeBytes(16U * 1024U);
-std::atomic<uint32_t> g_dynamicOffloadDecodeBytes(16U * 1024U);
+std::atomic<uint32_t> g_dynamicOffloadEncodeBytes(2U * 1024U * 1024U);
+std::atomic<uint32_t> g_dynamicOffloadDecodeBytes(1U * 1024U * 1024U);
 std::atomic<uint32_t> g_cudaDecisionCounter(0);
 
-static const uint32_t kMinCudaOffloadBytes = 16U * 1024U;
-static const uint32_t kMaxCudaOffloadBytes = 2U * 1024U * 1024U;
+static const uint32_t kMinCudaOffloadBytes = 256U * 1024U;
+static const uint32_t kMaxCudaOffloadBytes = 64U * 1024U * 1024U;
 
 thread_local WirehairCudaPath g_lastPath = WirehairCudaPath_CPU;
 
@@ -175,6 +178,17 @@ bool KernelGetStats(WirehairCudaPerfStats* statsOut)
     statsOut->kernel_event_us = kernelStats.kernel_event_us;
     statsOut->d2h_event_us = kernelStats.d2h_event_us;
     statsOut->e2e_event_us = kernelStats.e2e_event_us;
+    statsOut->enqueue_us = kernelStats.enqueue_us;
+    statsOut->queue_stall_us = kernelStats.queue_stall_us;
+    statsOut->queue_depth_samples = kernelStats.queue_depth_samples;
+    statsOut->queue_depth_total = kernelStats.queue_depth_total;
+    statsOut->device_idle_us = kernelStats.device_idle_us;
+    statsOut->submit_batches = kernelStats.submit_batches;
+    statsOut->submit_items = kernelStats.submit_items;
+    statsOut->producer_wait_us = kernelStats.producer_wait_us;
+    statsOut->transfer_wait_us = kernelStats.transfer_wait_us;
+    statsOut->compute_wait_us = kernelStats.compute_wait_us;
+    statsOut->completion_wait_us = kernelStats.completion_wait_us;
     statsOut->bytes_h2d = kernelStats.bytes_h2d;
     statsOut->bytes_d2h = kernelStats.bytes_d2h;
     return true;
@@ -288,12 +302,23 @@ bool ShouldAttemptCuda(
     const uint32_t dynamicThreshold = decodePath
         ? g_dynamicOffloadDecodeBytes.load(std::memory_order_relaxed)
         : g_dynamicOffloadEncodeBytes.load(std::memory_order_relaxed);
-    const uint32_t minItems = decodePath ? 24U : 16U;
-    const uint32_t minItemBytes = decodePath ? 1024U : 2048U;
+    const uint32_t streamCount = std::max<uint32_t>(1, g_streamCount.load(std::memory_order_relaxed));
+    const uint32_t shapeScore = std::min<uint32_t>(8U, (itemCount / 64U) + (itemBytes / 2048U));
+    uint32_t shapeAdjustedThreshold = dynamicThreshold;
+    if (shapeScore >= 5U && streamCount > 1U) {
+        shapeAdjustedThreshold = std::max<uint32_t>(kMinCudaOffloadBytes, dynamicThreshold / 2U);
+    } else if (shapeScore <= 2U) {
+        shapeAdjustedThreshold = std::min<uint32_t>(kMaxCudaOffloadBytes, dynamicThreshold * 2U);
+    }
+    const uint32_t minItems = decodePath ? 48U : 128U;
+    const uint32_t minItemBytes = decodePath ? 2048U : 4096U;
+    if (!decodePath && !cudaRequired && shapeScore < 5U) {
+        return false;
+    }
     if (!cudaRequired && (itemCount < minItems || itemBytes < minItemBytes)) {
         return false;
     }
-    if (!cudaRequired && bytesToProcess < dynamicThreshold) {
+    if (!cudaRequired && bytesToProcess < shapeAdjustedThreshold) {
         return false;
     }
     const uint32_t decisionCount = g_cudaDecisionCounter.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -305,6 +330,10 @@ bool ShouldAttemptCuda(
         {
             uint64_t transferUs = stats.h2d_event_us + stats.d2h_event_us;
             uint64_t kernelUs = stats.kernel_event_us;
+            const uint64_t enqueueUs = stats.enqueue_us;
+            const uint64_t queueDepth = (stats.queue_depth_samples > 0)
+                ? (stats.queue_depth_total / stats.queue_depth_samples)
+                : 1;
             if (transferUs == 0 || kernelUs == 0) {
                 transferUs = stats.h2d_us + stats.d2h_us + stats.sync_us;
                 kernelUs = stats.kernel_us;
@@ -317,6 +346,12 @@ bool ShouldAttemptCuda(
             } else if (kernelUs > transferUs && threshold > kMinCudaOffloadBytes) {
                 threshold = std::max<uint32_t>(kMinCudaOffloadBytes, threshold / 2U);
             }
+            if (queueDepth <= 1 && enqueueUs > kernelUs && threshold < kMaxCudaOffloadBytes) {
+                threshold = std::min<uint32_t>(kMaxCudaOffloadBytes, threshold * 2U);
+            }
+            if (queueDepth >= 3 && kernelUs > transferUs && threshold > kMinCudaOffloadBytes) {
+                threshold = std::max<uint32_t>(kMinCudaOffloadBytes, threshold / 2U);
+            }
             if (decodePath) {
                 g_dynamicOffloadDecodeBytes.store(threshold, std::memory_order_relaxed);
             } else {
@@ -325,6 +360,48 @@ bool ShouldAttemptCuda(
         }
     }
     return IsCudaReady();
+}
+
+uint32_t ComputeChunkItemCount(
+    bool decodePath,
+    uint32_t totalItems,
+    uint32_t itemStrideBytes)
+{
+    bool highMemoryProfile = g_streamCount.load(std::memory_order_relaxed) >= 8U;
+    const char* envProfile = std::getenv("WIREHAIR_CUDA_HIGH_MEM");
+    if (envProfile) {
+        highMemoryProfile = (std::strcmp(envProfile, "0") != 0 && std::strcmp(envProfile, "false") != 0);
+    }
+    const uint32_t streams = std::max<uint32_t>(1, g_streamCount.load(std::memory_order_relaxed));
+    const bool heavyShape = (totalItems >= 2048U) && (itemStrideBytes >= 4096U);
+    const bool mediumShape = (totalItems >= 1024U) && (itemStrideBytes >= 2048U);
+    const uint32_t targetChunkBytes = highMemoryProfile
+        ? (heavyShape
+            ? (decodePath ? (96U * 1024U * 1024U) : (64U * 1024U * 1024U))
+            : (mediumShape
+                ? (decodePath ? (24U * 1024U * 1024U) : (16U * 1024U * 1024U))
+                : (decodePath ? (8U * 1024U * 1024U) : (6U * 1024U * 1024U))))
+        : (heavyShape
+            ? (decodePath ? (32U * 1024U * 1024U) : (24U * 1024U * 1024U))
+            : (decodePath ? (8U * 1024U * 1024U) : (6U * 1024U * 1024U)));
+    uint32_t items = itemStrideBytes > 0 ? (targetChunkBytes / itemStrideBytes) : 1U;
+    if (items == 0) {
+        items = 1;
+    }
+    const uint32_t minChunk = highMemoryProfile
+        ? (heavyShape
+            ? (decodePath ? (streams * 64U) : (streams * 48U))
+            : (decodePath ? (streams * 10U) : (streams * 8U)))
+        : (decodePath ? (streams * 8U) : (streams * 6U));
+    const uint32_t maxChunk = highMemoryProfile
+        ? (heavyShape
+            ? (decodePath ? 32768U : 24576U)
+            : (decodePath ? 4096U : 3072U))
+        : (heavyShape
+            ? (decodePath ? 8192U : 4096U)
+            : (decodePath ? 2048U : 1536U));
+    items = std::max<uint32_t>(minChunk, std::min<uint32_t>(maxChunk, items));
+    return std::min<uint32_t>(totalItems, items);
 }
 
 } // namespace
@@ -502,6 +579,12 @@ WIREHAIR_EXPORT WirehairResult wirehair_cuda_encode_batch(
             return Wirehair_InvalidInput;
         }
     }
+    const uint32_t backendMode = g_backendMode.load(std::memory_order_relaxed);
+    if (backendMode != WirehairCudaBackend_CudaOnly) {
+        g_lastPath = WirehairCudaPath_CPU;
+        wirehair_free(codec);
+        return Wirehair_Success;
+    }
 
     bool cudaRequired = false;
     const uint64_t totalBytes64 = static_cast<uint64_t>(request->block_count) * request->block_stride_bytes;
@@ -509,23 +592,33 @@ WIREHAIR_EXPORT WirehairResult wirehair_cuda_encode_batch(
     const uint32_t totalBytes = totalBytes64 > maxU32 ? maxU32 : static_cast<uint32_t>(totalBytes64);
     if (ShouldAttemptCuda(&cudaRequired, totalBytes, false, request->block_count, request->block_bytes))
     {
-        WirehairCudaCoreBatchParams params = {};
-        params.struct_bytes = sizeof(WirehairCudaCoreBatchParams);
-        params.op = WirehairCudaCoreOp_EncodeParity;
-        params.item_count = request->block_count;
-        params.item_stride_bytes = request->block_stride_bytes;
-        params.item_bytes = request->block_bytes;
-        params.options = WirehairCudaCoreBatchOption_AllowHostRegister;
-        WirehairCudaCoreBatchResult batchResult = {};
-        batchResult.struct_bytes = sizeof(WirehairCudaCoreBatchResult);
-        if (!KernelProcessBatch(&params, request->block_data_out, request->block_data_out, &batchResult))
+        const uint32_t chunkItems = ComputeChunkItemCount(false, request->block_count, request->block_stride_bytes);
+        uint32_t offset = 0;
+        while (offset < request->block_count)
         {
-            wirehair_free(codec);
-            if (cudaRequired) {
-                return Wirehair_Error;
+            const uint32_t currentItems = std::min<uint32_t>(chunkItems, request->block_count - offset);
+            WirehairCudaCoreBatchParams params = {};
+            params.struct_bytes = sizeof(WirehairCudaCoreBatchParams);
+            params.op = WirehairCudaCoreOp_EncodeParity;
+            params.item_count = currentItems;
+            params.item_stride_bytes = request->block_stride_bytes;
+            params.item_bytes = request->block_bytes;
+            params.options = WirehairCudaCoreBatchOption_AllowHostRegister |
+                WirehairCudaCoreBatchOption_SkipChecksumCopy;
+            WirehairCudaCoreBatchResult batchResult = {};
+            batchResult.struct_bytes = sizeof(WirehairCudaCoreBatchResult);
+            uint8_t* chunkBase = reinterpret_cast<uint8_t*>(request->block_data_out) +
+                static_cast<size_t>(offset) * request->block_stride_bytes;
+            if (!KernelProcessBatch(&params, chunkBase, chunkBase, &batchResult))
+            {
+                wirehair_free(codec);
+                if (cudaRequired) {
+                    return Wirehair_Error;
+                }
+                g_lastPath = WirehairCudaPath_CPU;
+                return Wirehair_Success;
             }
-            g_lastPath = WirehairCudaPath_CPU;
-            return Wirehair_Success;
+            offset += currentItems;
         }
         g_lastPath = WirehairCudaPath_CUDA;
     }
@@ -560,16 +653,33 @@ WIREHAIR_EXPORT WirehairResult wirehair_cuda_decode_batch(
     const uint32_t totalBytes = totalBytes64 > maxU32 ? maxU32 : static_cast<uint32_t>(totalBytes64);
     if (ShouldAttemptCuda(&cudaRequired, totalBytes, true, request->symbol_count, request->block_bytes))
     {
-        WirehairCudaCoreBatchParams params = {};
-        params.struct_bytes = sizeof(WirehairCudaCoreBatchParams);
-        params.op = WirehairCudaCoreOp_DecodeSolve;
-        params.item_count = request->symbol_count;
-        params.item_stride_bytes = request->block_stride_bytes;
-        params.item_bytes = request->block_bytes;
-        params.options = WirehairCudaCoreBatchOption_AllowHostRegister | WirehairCudaCoreBatchOption_SkipOutputCopy;
-        WirehairCudaCoreBatchResult batchResult = {};
-        batchResult.struct_bytes = sizeof(WirehairCudaCoreBatchResult);
-        if (!KernelProcessBatch(&params, request->block_data, nullptr, &batchResult))
+        const uint32_t chunkItems = ComputeChunkItemCount(true, request->symbol_count, request->block_stride_bytes);
+        uint32_t offset = 0;
+        bool preprocessOk = true;
+        while (offset < request->symbol_count)
+        {
+            const uint32_t currentItems = std::min<uint32_t>(chunkItems, request->symbol_count - offset);
+            WirehairCudaCoreBatchParams params = {};
+            params.struct_bytes = sizeof(WirehairCudaCoreBatchParams);
+            params.op = WirehairCudaCoreOp_DecodeSolve;
+            params.item_count = currentItems;
+            params.item_stride_bytes = request->block_stride_bytes;
+            params.item_bytes = request->block_bytes;
+            params.options = WirehairCudaCoreBatchOption_AllowHostRegister |
+                WirehairCudaCoreBatchOption_SkipOutputCopy |
+                WirehairCudaCoreBatchOption_SkipChecksumCopy;
+            WirehairCudaCoreBatchResult batchResult = {};
+            batchResult.struct_bytes = sizeof(WirehairCudaCoreBatchResult);
+            const uint8_t* chunkBase = reinterpret_cast<const uint8_t*>(request->block_data) +
+                static_cast<size_t>(offset) * request->block_stride_bytes;
+            if (!KernelProcessBatch(&params, chunkBase, nullptr, &batchResult))
+            {
+                preprocessOk = false;
+                break;
+            }
+            offset += currentItems;
+        }
+        if (!preprocessOk)
         {
             wirehair_free(decoder);
             if (cudaRequired) {
