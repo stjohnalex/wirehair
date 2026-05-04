@@ -978,6 +978,12 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
         }
         if (rw)
         {
+            std::FILE* readFile = std::fopen(packPath.c_str(), "rb");
+            std::vector<char> readIoBuffer;
+            if (readFile) {
+                readIoBuffer.assign(highMemoryMode ? (8U * 1024U * 1024U) : (2U * 1024U * 1024U), 0);
+                std::setvbuf(readFile, readIoBuffer.data(), _IOFBF, readIoBuffer.size());
+            }
             struct ReadBatch
             {
                 bool Ok = true;
@@ -1007,11 +1013,20 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
                     const std::streamoff offset = static_cast<std::streamoff>(sourceIndex) * blockBytes;
                     uint8_t* symbol = &batch.Data[i * static_cast<size_t>(blockBytes)];
                     const uint64_t r0 = NowUs();
-                    rw.seekg(offset, std::ios::beg);
-                    rw.read(reinterpret_cast<char*>(symbol), blockBytes);
+                    size_t got = 0;
+                    if (readFile)
+                    {
+#if defined(_WIN32)
+                        if (_fseeki64(readFile, static_cast<long long>(offset), SEEK_SET) == 0)
+#else
+                        if (std::fseeko(readFile, static_cast<off_t>(offset), SEEK_SET) == 0)
+#endif
+                        {
+                            got = std::fread(symbol, 1, blockBytes, readFile);
+                        }
+                    }
                     const uint64_t r1 = NowUs();
-                    const std::streamsize got = rw.gcount();
-                    if (got <= 0) {
+                    if (got == 0) {
                         batch.Ok = false;
                         break;
                     }
@@ -1120,6 +1135,9 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
                         }
                     }
                 }
+            }
+            if (readFile) {
+                std::fclose(readFile);
             }
         }
         if (ok) {
