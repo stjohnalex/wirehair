@@ -67,7 +67,8 @@ def avg_core_field(items: List[Dict], field: str) -> float:
 def collect_throughput_snapshot(label: str, data: Dict) -> Dict:
     core = data.get("core", [])
     ts = data.get("thread_scaling", [])
-    st = data.get("storage", {})
+    st = get_storage_payload(data, "storage_isolated")
+    st_e2e = get_storage_payload(data, "storage_e2e_cuda")
     max_enc_ts = max((float(x.get("encode_mbps", 0.0)) for x in ts), default=0.0)
     max_threads_row = max(ts, key=lambda x: float(x.get("encode_mbps", 0.0))) if ts else {}
     return {
@@ -77,6 +78,8 @@ def collect_throughput_snapshot(label: str, data: Dict) -> Dict:
         "core_recover_mbps": avg_core_field(core, "recover_mbps"),
         "storage_write_mbps": float(st.get("write_mbps", 0.0)),
         "storage_read_mbps": float(st.get("read_mbps", 0.0)),
+        "storage_e2e_write_mbps": float(st_e2e.get("write_mbps", 0.0)),
+        "storage_e2e_read_mbps": float(st_e2e.get("read_mbps", 0.0)),
         "thread_peak_encode_mbps": float(max_enc_ts),
         "thread_peak_threads": float(max_threads_row.get("threads", 0)) if max_threads_row else 0.0,
     }
@@ -124,6 +127,43 @@ def summarize_delta(rows: List[Dict], metric: str) -> float:
     return sum(values) / len(values)
 
 
+def get_storage_payload(data: Dict, profile_key: str) -> Dict:
+    profiles = data.get("storage_profiles", {})
+    if isinstance(profiles, dict):
+        prof = profiles.get(profile_key)
+        if isinstance(prof, dict):
+            return prof
+    return data.get("storage", {})
+
+
+def compare_storage_payload(control_storage: Dict, variant_storage: Dict) -> Dict:
+    storage = {
+        "write_mbps": {
+            "control": float(control_storage.get("write_mbps", 0.0)),
+            "variant": float(variant_storage.get("write_mbps", 0.0)),
+        },
+        "read_mbps": {
+            "control": float(control_storage.get("read_mbps", 0.0)),
+            "variant": float(variant_storage.get("read_mbps", 0.0)),
+        },
+        "success_rate": {
+            "control": float(control_storage.get("success_rate", 0.0)),
+            "variant": float(variant_storage.get("success_rate", 0.0)),
+        },
+        "random_read_p95_ms": {
+            "control": float(control_storage.get("random_read_p95_ms", 0.0)),
+            "variant": float(variant_storage.get("random_read_p95_ms", 0.0)),
+        },
+        "random_write_p95_ms": {
+            "control": float(control_storage.get("random_write_p95_ms", 0.0)),
+            "variant": float(variant_storage.get("random_write_p95_ms", 0.0)),
+        },
+    }
+    for metric in storage.values():
+        metric["delta_pct"] = pct_delta(metric["control"], metric["variant"])
+    return storage
+
+
 def parse_variant_arg(raw: str) -> Tuple[str, str]:
     parts = raw.split("=", 1)
     if len(parts) != 2 or not parts[0] or not parts[1]:
@@ -151,32 +191,12 @@ def build_variant_report(control: Dict, variant_label: str, variant_data: Dict) 
         ["success_rate", "avg_needed"],
     )
 
-    c_storage = control.get("storage", {})
-    v_storage = variant_data.get("storage", {})
-    storage = {
-        "write_mbps": {
-            "control": float(c_storage.get("write_mbps", 0.0)),
-            "variant": float(v_storage.get("write_mbps", 0.0)),
-        },
-        "read_mbps": {
-            "control": float(c_storage.get("read_mbps", 0.0)),
-            "variant": float(v_storage.get("read_mbps", 0.0)),
-        },
-        "success_rate": {
-            "control": float(c_storage.get("success_rate", 0.0)),
-            "variant": float(v_storage.get("success_rate", 0.0)),
-        },
-        "random_read_p95_ms": {
-            "control": float(c_storage.get("random_read_p95_ms", 0.0)),
-            "variant": float(v_storage.get("random_read_p95_ms", 0.0)),
-        },
-        "random_write_p95_ms": {
-            "control": float(c_storage.get("random_write_p95_ms", 0.0)),
-            "variant": float(v_storage.get("random_write_p95_ms", 0.0)),
-        },
-    }
-    for metric in storage.values():
-        metric["delta_pct"] = pct_delta(metric["control"], metric["variant"])
+    c_storage = get_storage_payload(control, "storage_isolated")
+    v_storage = get_storage_payload(variant_data, "storage_isolated")
+    storage = compare_storage_payload(c_storage, v_storage)
+    c_storage_e2e = get_storage_payload(control, "storage_e2e_cuda")
+    v_storage_e2e = get_storage_payload(variant_data, "storage_e2e_cuda")
+    storage_e2e = compare_storage_payload(c_storage_e2e, v_storage_e2e)
 
     summary = {
         "core_encode_mbps_avg_delta_pct": summarize_delta(core_rows, "encode_mbps"),
@@ -188,6 +208,10 @@ def build_variant_report(control: Dict, variant_label: str, variant_data: Dict) 
         "storage_read_mbps_delta_pct": storage["read_mbps"]["delta_pct"],
         "storage_random_read_p95_delta_pct": storage["random_read_p95_ms"]["delta_pct"],
         "storage_random_write_p95_delta_pct": storage["random_write_p95_ms"]["delta_pct"],
+        "storage_e2e_write_mbps_delta_pct": storage_e2e["write_mbps"]["delta_pct"],
+        "storage_e2e_read_mbps_delta_pct": storage_e2e["read_mbps"]["delta_pct"],
+        "storage_e2e_random_read_p95_delta_pct": storage_e2e["random_read_p95_ms"]["delta_pct"],
+        "storage_e2e_random_write_p95_delta_pct": storage_e2e["random_write_p95_ms"]["delta_pct"],
     }
 
     control_scaling = {int(x.get("threads", 0)): x for x in control.get("thread_scaling", [])}
@@ -224,6 +248,10 @@ def build_variant_report(control: Dict, variant_label: str, variant_data: Dict) 
         "parity": parity_rows,
         "churn": churn_rows,
         "storage": storage,
+        "storage_profiles": {
+            "storage_isolated": storage,
+            "storage_e2e_cuda": storage_e2e,
+        },
         "storage_mode_profile": str(v_storage.get("mode_profile", "balanced")),
         "thread_scaling": scaling_rows,
         "summary": summary,
@@ -248,6 +276,12 @@ def print_variant_summary(report: Dict) -> None:
     print(
         f"  storage random p95 read={summary['storage_random_read_p95_delta_pct']:.2f}% "
         f"write={summary['storage_random_write_p95_delta_pct']:.2f}% (lower is better)"
+    )
+    print(
+        f"  storage_e2e write={summary['storage_e2e_write_mbps_delta_pct']:.2f}% "
+        f"read={summary['storage_e2e_read_mbps_delta_pct']:.2f}% "
+        f"rnd_p95_read={summary['storage_e2e_random_read_p95_delta_pct']:.2f}% "
+        f"rnd_p95_write={summary['storage_e2e_random_write_p95_delta_pct']:.2f}%"
     )
     print(f"  storage mode_profile={report.get('storage_mode_profile', 'balanced')}")
     print(
@@ -286,6 +320,16 @@ def print_variant_summary(report: Dict) -> None:
             f"device_idle_pct={float(cuda_perf.get('device_idle_pct', 0.0)):.2f} "
             f"symbols_per_submit={float(cuda_perf.get('symbols_per_submit', 0.0)):.2f} "
             f"overlap_ratio={float(cuda_perf.get('overlap_ratio', 0.0)):.2f}"
+        )
+        print(
+            "  cuda solver "
+            f"stage_us={int(cuda_perf.get('solver_stage_us', 0))} "
+            f"pivot_us={int(cuda_perf.get('solver_pivot_us', 0))} "
+            f"eliminate_us={int(cuda_perf.get('solver_eliminate_us', 0))} "
+            f"backsub_us={int(cuda_perf.get('solver_backsub_us', 0))} "
+            f"verify_passes={int(cuda_perf.get('solver_verify_passes', 0))} "
+            f"verify_failures={int(cuda_perf.get('solver_verify_failures', 0))} "
+            f"solver_kernel_share_pct={float(cuda_perf.get('solver_kernel_share_pct', 0.0)):.2f}"
         )
 
 
@@ -436,6 +480,18 @@ def main() -> int:
         help="If set, fail unless CUDA overlap_ratio >= this value.",
     )
     parser.add_argument(
+        "--require-cuda-solver-kernel-share-pct",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA solver_kernel_share_pct >= this value.",
+    )
+    parser.add_argument(
+        "--require-cuda-solver-verify-failures-max",
+        type=float,
+        default=None,
+        help="If set, fail unless CUDA solver_verify_failures <= this value.",
+    )
+    parser.add_argument(
         "--require-cuda-random-read-delta",
         type=float,
         default=None,
@@ -561,7 +617,9 @@ def main() -> int:
             args.require_cuda_min_queue_depth is not None or
             args.require_cuda_max_device_idle_pct is not None or
             args.require_cuda_min_symbols_per_submit is not None or
-            args.require_cuda_min_overlap_ratio is not None):
+            args.require_cuda_min_overlap_ratio is not None or
+            args.require_cuda_solver_kernel_share_pct is not None or
+            args.require_cuda_solver_verify_failures_max is not None):
         cuda_entry = next((x for x in variant_reports if x.get("label") == "cuda"), None)
         if cuda_entry is None:
             print("CUDA utilization gate requested but no cuda variant was supplied.")
@@ -573,6 +631,8 @@ def main() -> int:
         device_idle_pct = float(cuda_perf.get("device_idle_pct", 0.0))
         symbols_per_submit = float(cuda_perf.get("symbols_per_submit", 0.0))
         overlap_ratio = float(cuda_perf.get("overlap_ratio", 0.0))
+        solver_kernel_share_pct = float(cuda_perf.get("solver_kernel_share_pct", 0.0))
+        solver_verify_failures = float(cuda_perf.get("solver_verify_failures", 0.0))
         if args.require_cuda_kernel_share_pct is not None and kernel_share < args.require_cuda_kernel_share_pct:
             print(
                 f"CUDA kernel share gate failed: {kernel_share:.2f}% "
@@ -607,6 +667,20 @@ def main() -> int:
             print(
                 f"CUDA overlap-ratio gate failed: {overlap_ratio:.2f} "
                 f"< required {args.require_cuda_min_overlap_ratio:.2f}"
+            )
+            return 3
+        if (args.require_cuda_solver_kernel_share_pct is not None and
+                solver_kernel_share_pct < args.require_cuda_solver_kernel_share_pct):
+            print(
+                f"CUDA solver kernel share gate failed: {solver_kernel_share_pct:.2f}% "
+                f"< required {args.require_cuda_solver_kernel_share_pct:.2f}%"
+            )
+            return 3
+        if (args.require_cuda_solver_verify_failures_max is not None and
+                solver_verify_failures > args.require_cuda_solver_verify_failures_max):
+            print(
+                f"CUDA solver verify failure gate failed: {solver_verify_failures:.0f} "
+                f"> allowed {args.require_cuda_solver_verify_failures_max:.0f}"
             )
             return 3
         if args.require_cuda_random_read_delta is not None:

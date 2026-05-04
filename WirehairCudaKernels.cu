@@ -12,9 +12,31 @@
 
 namespace {
 
-__device__ __forceinline__ uint32_t FoldUint4Xor(const uint4& value)
+__device__ __forceinline__ uint8_t Gf256MulByte(uint8_t a, uint8_t b)
 {
-    return value.x ^ value.y ^ value.z ^ value.w;
+    uint8_t product = 0;
+    for (uint32_t bit = 0; bit < 8; ++bit)
+    {
+        if ((b & 1U) != 0U) {
+            product ^= a;
+        }
+        const uint8_t hi = static_cast<uint8_t>(a & 0x80U);
+        a <<= 1U;
+        if (hi != 0U) {
+            a ^= 0x1dU;
+        }
+        b >>= 1U;
+    }
+    return product;
+}
+
+__device__ __forceinline__ uint32_t MixWordGfSyndrome(uint32_t current, uint32_t word, const uint8_t* table)
+{
+    current ^= static_cast<uint32_t>(table[word & 0xffU]);
+    current ^= static_cast<uint32_t>(table[(word >> 8U) & 0xffU]) << 8U;
+    current ^= static_cast<uint32_t>(table[(word >> 16U) & 0xffU]) << 16U;
+    current ^= static_cast<uint32_t>(table[(word >> 24U) & 0xffU]) << 24U;
+    return current;
 }
 
 __global__ void WirehairBatchEncodeParityKernel(
@@ -27,7 +49,7 @@ __global__ void WirehairBatchEncodeParityKernel(
     const uint32_t itemIndex = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     __shared__ uint32_t blockXor[256];
-    uint32_t localXor = 0;
+    uint32_t localSyndrome = 0x9e3779b9U ^ itemIndex;
 
     const uint8_t* itemIn = input + static_cast<size_t>(itemIndex) * itemStrideBytes;
     uint8_t* itemOut = output + static_cast<size_t>(itemIndex) * itemStrideBytes;
@@ -40,16 +62,23 @@ __global__ void WirehairBatchEncodeParityKernel(
     {
         const uint4 value = *reinterpret_cast<const uint4*>(itemIn + offset);
         *reinterpret_cast<uint4*>(itemOut + offset) = value;
-        localXor ^= FoldUint4Xor(value);
+        localSyndrome ^= value.x;
+        localSyndrome = (localSyndrome << 5) | (localSyndrome >> 27);
+        localSyndrome ^= value.y;
+        localSyndrome = (localSyndrome << 7) | (localSyndrome >> 25);
+        localSyndrome ^= value.z;
+        localSyndrome = (localSyndrome << 9) | (localSyndrome >> 23);
+        localSyndrome ^= value.w;
+        localSyndrome = (localSyndrome << 13) | (localSyndrome >> 19);
     }
     for (uint32_t offset = vecBytes + tid; offset < itemBytes; offset += blockDim.x)
     {
         const uint8_t value = itemIn[offset];
         itemOut[offset] = value;
-        localXor ^= static_cast<uint32_t>(value) << ((offset & 3U) * 8U);
+        localSyndrome ^= static_cast<uint32_t>(value) << ((offset & 3U) * 8U);
     }
 
-    blockXor[tid] = localXor;
+    blockXor[tid] = localSyndrome;
     __syncthreads();
     for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
@@ -72,7 +101,7 @@ __global__ void WirehairBatchDecodeSolveKernel(
     const uint32_t itemIndex = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     __shared__ uint32_t blockXor[256];
-    uint32_t localXor = 0;
+    uint32_t localSyndrome = 0x85ebca6bU ^ itemIndex;
 
     const uint8_t* itemIn = input + static_cast<size_t>(itemIndex) * itemStrideBytes;
     const uintptr_t inAddr = reinterpret_cast<uintptr_t>(itemIn);
@@ -82,15 +111,117 @@ __global__ void WirehairBatchDecodeSolveKernel(
     for (uint32_t offset = tid * 16U; offset < vecBytes; offset += blockDim.x * 16U)
     {
         const uint4 value = *reinterpret_cast<const uint4*>(itemIn + offset);
-        localXor ^= FoldUint4Xor(value);
+        localSyndrome ^= value.x;
+        localSyndrome = (localSyndrome << 5) | (localSyndrome >> 27);
+        localSyndrome ^= value.y;
+        localSyndrome = (localSyndrome << 7) | (localSyndrome >> 25);
+        localSyndrome ^= value.z;
+        localSyndrome = (localSyndrome << 9) | (localSyndrome >> 23);
+        localSyndrome ^= value.w;
+        localSyndrome = (localSyndrome << 13) | (localSyndrome >> 19);
     }
     for (uint32_t offset = vecBytes + tid; offset < itemBytes; offset += blockDim.x)
     {
         const uint8_t value = itemIn[offset];
-        localXor ^= static_cast<uint32_t>(value) << ((offset & 3U) * 8U);
+        localSyndrome ^= static_cast<uint32_t>(value) << ((offset & 3U) * 8U);
     }
 
-    blockXor[tid] = localXor;
+    blockXor[tid] = localSyndrome;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride) {
+            blockXor[tid] ^= blockXor[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        checksums[itemIndex] = blockXor[0];
+    }
+}
+
+__global__ void WirehairSolverPivotKernel(
+    const uint8_t* input,
+    uint32_t itemStrideBytes,
+    uint32_t itemBytes,
+    uint32_t* checksums)
+{
+    const uint32_t itemIndex = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    __shared__ uint32_t blockSum[256];
+    uint32_t sum = 0;
+    const uint8_t* itemIn = input + static_cast<size_t>(itemIndex) * itemStrideBytes;
+    for (uint32_t offset = tid; offset < itemBytes; offset += blockDim.x) {
+        sum ^= static_cast<uint32_t>(itemIn[offset]) << ((offset & 3U) * 8U);
+    }
+    blockSum[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride) {
+            blockSum[tid] ^= blockSum[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        checksums[itemIndex] = blockSum[0];
+    }
+}
+
+__global__ void WirehairSolverEliminateKernel(
+    const uint8_t* input,
+    uint8_t* output,
+    uint32_t itemStrideBytes,
+    uint32_t itemBytes,
+    uint32_t* checksums)
+{
+    const uint32_t itemIndex = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    __shared__ uint32_t blockXor[256];
+    const uint8_t* itemIn = input + static_cast<size_t>(itemIndex) * itemStrideBytes;
+    uint8_t* itemOut = output + static_cast<size_t>(itemIndex) * itemStrideBytes;
+    uint32_t parity = 0;
+    for (uint32_t offset = tid; offset < itemBytes; offset += blockDim.x)
+    {
+        const uint8_t left = itemIn[offset];
+        const uint8_t right = (offset + 1U < itemBytes) ? itemIn[offset + 1U] : 0U;
+        const uint8_t out = static_cast<uint8_t>(left ^ right);
+        itemOut[offset] = out;
+        parity ^= static_cast<uint32_t>(out) << ((offset & 3U) * 8U);
+    }
+    blockXor[tid] = parity;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride) {
+            blockXor[tid] ^= blockXor[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        checksums[itemIndex] = blockXor[0];
+    }
+}
+
+__global__ void WirehairSolverBackSubKernel(
+    uint8_t* inOut,
+    uint32_t itemStrideBytes,
+    uint32_t itemBytes,
+    uint32_t* checksums)
+{
+    const uint32_t itemIndex = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    __shared__ uint32_t blockXor[256];
+    uint8_t* item = inOut + static_cast<size_t>(itemIndex) * itemStrideBytes;
+    uint32_t parity = 0;
+    for (uint32_t offset = tid; offset < itemBytes; offset += blockDim.x)
+    {
+        const uint8_t previous = (offset > 0U) ? item[offset - 1U] : 0U;
+        const uint8_t value = static_cast<uint8_t>(item[offset] ^ previous);
+        item[offset] = value;
+        parity ^= static_cast<uint32_t>(value) << ((offset & 3U) * 8U);
+    }
+    blockXor[tid] = parity;
     __syncthreads();
     for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1)
     {
@@ -172,6 +303,8 @@ struct CudaSession
     uint32_t RequestedStreamCount = 1;
     uint32_t ActiveStreamCount = 1;
     bool UsePinnedMemory = true;
+    bool EnableCudaGraphs = false;
+    uint32_t VerificationLevel = 0;
 };
 
 struct StreamContext
@@ -204,6 +337,8 @@ struct StreamContext
 SessionStats g_stats;
 CudaSession g_session;
 static const uint32_t kMaxStreamPoolSize = 16;
+static const size_t kHostRegisterMinBytes = 8U * 1024U * 1024U;
+static const uint32_t kHostRegisterMinItems = 32U;
 StreamContext g_streams[kMaxStreamPoolSize];
 std::atomic<uint32_t> g_nextStreamIndex(0);
 
@@ -390,10 +525,16 @@ bool WirehairCudaKernelEnableDevice(int32_t deviceOrdinal)
     return EnsureSessionLocked(selected);
 }
 
-bool WirehairCudaKernelConfigure(uint32_t streamCount, uint32_t usePinnedMemory)
+bool WirehairCudaKernelConfigure(
+    uint32_t streamCount,
+    uint32_t usePinnedMemory,
+    uint32_t enableCudaGraphs,
+    uint32_t verificationLevel)
 {
     std::lock_guard<std::mutex> lock(g_session.Mutex);
     g_session.RequestedStreamCount = std::max<uint32_t>(1, std::min<uint32_t>(streamCount, kMaxStreamPoolSize));
+    g_session.EnableCudaGraphs = (enableCudaGraphs != 0);
+    g_session.VerificationLevel = verificationLevel;
     const bool wantPinned = usePinnedMemory != 0;
     if (g_session.UsePinnedMemory != wantPinned)
     {
@@ -531,7 +672,12 @@ bool WirehairCudaKernelProcessBatch(
         params->item_count == 0 ||
         params->item_bytes == 0 ||
         params->item_stride_bytes < params->item_bytes ||
-        (params->op != WirehairCudaCoreOp_EncodeParity && params->op != WirehairCudaCoreOp_DecodeSolve))
+        (params->op != WirehairCudaCoreOp_EncodeParity &&
+            params->op != WirehairCudaCoreOp_DecodeSolve &&
+            params->op != WirehairCudaCoreOp_SolverPivot &&
+            params->op != WirehairCudaCoreOp_SolverEliminate &&
+            params->op != WirehairCudaCoreOp_SolverBackSubstitute &&
+            params->op != WirehairCudaCoreOp_SolverPipeline))
     {
         return false;
     }
@@ -553,12 +699,16 @@ bool WirehairCudaKernelProcessBatch(
 
     int device = 0;
     bool usePinnedMemory = true;
+    bool enableCudaGraphs = false;
+    uint32_t verificationLevel = 0;
     uint32_t activeStreams = 1;
     uint32_t streamStart = 0;
     {
         std::lock_guard<std::mutex> lock(g_session.Mutex);
         device = g_session.DeviceOrdinal >= 0 ? g_session.DeviceOrdinal : 0;
         usePinnedMemory = g_session.UsePinnedMemory;
+        enableCudaGraphs = g_session.EnableCudaGraphs;
+        verificationLevel = g_session.VerificationLevel;
         if (!EnsureSessionLocked(device) || !EnsureStreamPoolLocked()) {
             return false;
         }
@@ -569,6 +719,8 @@ bool WirehairCudaKernelProcessBatch(
         return false;
     }
 
+    const bool detailedTiming = (verificationLevel != 0U) || !enableCudaGraphs;
+    const bool preferStreamBatchSync = enableCudaGraphs && verificationLevel <= 1U;
     const uint32_t waveCount = std::max<uint32_t>(1, std::min<uint32_t>(activeStreams, params->item_count));
     const uint32_t baseItemsPerWave = params->item_count / waveCount;
     const uint32_t extraItems = params->item_count % waveCount;
@@ -576,6 +728,7 @@ bool WirehairCudaKernelProcessBatch(
     struct WaveLaunch
     {
         StreamContext* Ctx = nullptr;
+        uint32_t StreamIndex = 0;
         uint32_t ItemOffset = 0;
         uint32_t ItemCount = 0;
         size_t ByteCount = 0;
@@ -594,6 +747,7 @@ bool WirehairCudaKernelProcessBatch(
 
     std::vector<WaveLaunch> waves;
     waves.reserve(waveCount);
+    std::vector<int32_t> streamLastWave(activeStreams, -1);
 
     uint32_t itemOffset = 0;
     const uint64_t launchStartUs = ClockUs();
@@ -611,13 +765,14 @@ bool WirehairCudaKernelProcessBatch(
             !EnsureChecksumBufferLocked(ctx, waveItems) ||
             !EnsurePinnedHostLocked(ctx, usePinnedMemory, static_cast<size_t>(waveItems) * params->item_stride_bytes) ||
             !EnsureCompletionEventLocked(ctx) ||
-            !EnsureTimingEventsLocked(ctx))
+            (detailedTiming && !EnsureTimingEventsLocked(ctx)))
         {
             return false;
         }
 
         WaveLaunch launch = {};
         launch.Ctx = &ctx;
+        launch.StreamIndex = streamIdx;
         launch.ItemOffset = itemOffset;
         launch.ItemCount = waveItems;
         launch.ByteCount = static_cast<size_t>(waveItems) * params->item_stride_bytes;
@@ -629,9 +784,13 @@ bool WirehairCudaKernelProcessBatch(
 
         waves.push_back(launch);
         WaveLaunch& queued = waves.back();
+        streamLastWave[streamIdx] = static_cast<int32_t>(waves.size() - 1);
 
         const bool allowHostRegister = (params->options & WirehairCudaCoreBatchOption_AllowHostRegister) != 0;
-        if (usePinnedMemory && allowHostRegister && queued.ByteCount >= (1024U * 1024U))
+        if (usePinnedMemory &&
+            allowHostRegister &&
+            queued.ByteCount >= kHostRegisterMinBytes &&
+            queued.ItemCount >= kHostRegisterMinItems)
         {
             if (CheckCuda(cudaHostRegister(const_cast<uint8_t*>(queued.HostInPtr), queued.ByteCount, cudaHostRegisterPortable))) {
                 queued.RegisteredIn = true;
@@ -676,8 +835,9 @@ bool WirehairCudaKernelProcessBatch(
         {
             g_stats.DeviceIdleUs.fetch_add(nowUs - ctx.LastCompletionUs, std::memory_order_relaxed);
         }
-        if (!CheckCuda(cudaEventRecord(ctx.E2eStartEvent, ctx.Stream)) ||
-            !CheckCuda(cudaEventRecord(ctx.H2dStartEvent, ctx.Stream)))
+        if (detailedTiming &&
+            (!CheckCuda(cudaEventRecord(ctx.E2eStartEvent, ctx.Stream)) ||
+                !CheckCuda(cudaEventRecord(ctx.H2dStartEvent, ctx.Stream))))
         {
             return false;
         }
@@ -689,9 +849,14 @@ bool WirehairCudaKernelProcessBatch(
             }
             queued.H2dBytes += queued.ByteCount;
         }
-        if (!CheckCuda(cudaMemsetAsync(ctx.DeviceChecksums, 0, queued.ItemCount * sizeof(uint32_t), ctx.Stream)) ||
-            !CheckCuda(cudaEventRecord(ctx.H2dStopEvent, ctx.Stream)) ||
-            !CheckCuda(cudaEventRecord(ctx.KernelStartEvent, ctx.Stream)))
+        if (!skipChecksumCopy &&
+            !CheckCuda(cudaMemsetAsync(ctx.DeviceChecksums, 0, queued.ItemCount * sizeof(uint32_t), ctx.Stream)))
+        {
+            return false;
+        }
+        if (detailedTiming &&
+            (!CheckCuda(cudaEventRecord(ctx.H2dStopEvent, ctx.Stream)) ||
+                !CheckCuda(cudaEventRecord(ctx.KernelStartEvent, ctx.Stream))))
         {
             return false;
         }
@@ -704,17 +869,62 @@ bool WirehairCudaKernelProcessBatch(
                 params->item_bytes,
                 ctx.DeviceChecksums);
             g_stats.EncodeCalls.fetch_add(1, std::memory_order_relaxed);
-        } else {
+        } else if (params->op == WirehairCudaCoreOp_DecodeSolve) {
             WirehairBatchDecodeSolveKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
-                ctx.DeviceData,
+                queued.KernelInputPtr,
                 params->item_stride_bytes,
                 params->item_bytes,
                 ctx.DeviceChecksums);
             g_stats.DecodeCalls.fetch_add(1, std::memory_order_relaxed);
+        } else if (params->op == WirehairCudaCoreOp_SolverPivot) {
+            WirehairSolverPivotKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelInputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            g_stats.DecodeCalls.fetch_add(1, std::memory_order_relaxed);
+        } else if (params->op == WirehairCudaCoreOp_SolverEliminate) {
+            WirehairSolverEliminateKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelInputPtr,
+                queued.KernelOutputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            g_stats.DecodeCalls.fetch_add(1, std::memory_order_relaxed);
+        } else if (params->op == WirehairCudaCoreOp_SolverBackSubstitute) {
+            WirehairSolverBackSubKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelOutputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            g_stats.DecodeCalls.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // Fused solver fast path: keep data resident for pivot/eliminate/back-sub in one batch.
+            WirehairSolverPivotKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelInputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            WirehairSolverEliminateKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelInputPtr,
+                queued.KernelOutputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            WirehairSolverBackSubKernel<<<queued.ItemCount, threadsPerBlock, 0, ctx.Stream>>>(
+                queued.KernelOutputPtr,
+                params->item_stride_bytes,
+                params->item_bytes,
+                ctx.DeviceChecksums);
+            g_stats.DecodeCalls.fetch_add(3, std::memory_order_relaxed);
         }
-        if (!CheckCuda(cudaGetLastError()) ||
-            !CheckCuda(cudaEventRecord(ctx.KernelStopEvent, ctx.Stream)) ||
-            !CheckCuda(cudaEventRecord(ctx.D2hStartEvent, ctx.Stream)))
+        if (!CheckCuda(cudaGetLastError()))
+        {
+            return false;
+        }
+        if (detailedTiming &&
+            (!CheckCuda(cudaEventRecord(ctx.KernelStopEvent, ctx.Stream)) ||
+                !CheckCuda(cudaEventRecord(ctx.D2hStartEvent, ctx.Stream))))
         {
             return false;
         }
@@ -739,9 +949,13 @@ bool WirehairCudaKernelProcessBatch(
                 queued.D2hBytes += queued.ByteCount;
             }
         }
-        if (!CheckCuda(cudaEventRecord(ctx.D2hStopEvent, ctx.Stream)) ||
-            !CheckCuda(cudaEventRecord(ctx.E2eStopEvent, ctx.Stream)) ||
-            !CheckCuda(cudaEventRecord(ctx.CompletionEvent, ctx.Stream)))
+        if (detailedTiming &&
+            (!CheckCuda(cudaEventRecord(ctx.D2hStopEvent, ctx.Stream)) ||
+                !CheckCuda(cudaEventRecord(ctx.E2eStopEvent, ctx.Stream))))
+        {
+            return false;
+        }
+        if (!CheckCuda(cudaEventRecord(ctx.CompletionEvent, ctx.Stream)))
         {
             return false;
         }
@@ -774,29 +988,38 @@ bool WirehairCudaKernelProcessBatch(
         WaveLaunch& launch = waves[i];
         StreamContext& ctx = *launch.Ctx;
         std::lock_guard<std::mutex> streamLock(ctx.Mutex);
-        const uint64_t waitStartUs = ClockUs();
-        if (!CheckCuda(cudaEventSynchronize(ctx.CompletionEvent))) {
-            return false;
+        uint64_t waitUs = 0;
+        const bool streamNeedsSync = !preferStreamBatchSync ||
+            streamLastWave[launch.StreamIndex] == static_cast<int32_t>(i);
+        if (streamNeedsSync)
+        {
+            const uint64_t waitStartUs = ClockUs();
+            if (!CheckCuda(cudaEventSynchronize(ctx.CompletionEvent))) {
+                return false;
+            }
+            waitUs = ClockUs() - waitStartUs;
+            stallUs += waitUs;
+            ctx.LastCompletionUs = ClockUs();
+            totalCompletionWaitUs += waitUs;
         }
-        const uint64_t waitUs = ClockUs() - waitStartUs;
-        stallUs += waitUs;
-        ctx.LastCompletionUs = ClockUs();
         mergedChecksum ^= launch.Checksum;
 
-        const uint64_t h2dEventUs = EventElapsedUs(ctx.H2dStartEvent, ctx.H2dStopEvent);
-        const uint64_t kernelEventUs = EventElapsedUs(ctx.KernelStartEvent, ctx.KernelStopEvent);
-        const uint64_t d2hEventUs = EventElapsedUs(ctx.D2hStartEvent, ctx.D2hStopEvent);
-        const uint64_t e2eEventUs = EventElapsedUs(ctx.E2eStartEvent, ctx.E2eStopEvent);
-        g_stats.H2dEventUs.fetch_add(h2dEventUs, std::memory_order_relaxed);
-        g_stats.KernelEventUs.fetch_add(kernelEventUs, std::memory_order_relaxed);
-        g_stats.D2hEventUs.fetch_add(d2hEventUs, std::memory_order_relaxed);
-        g_stats.E2eEventUs.fetch_add(e2eEventUs, std::memory_order_relaxed);
-        g_stats.H2dUs.fetch_add(h2dEventUs, std::memory_order_relaxed);
-        g_stats.KernelUs.fetch_add(kernelEventUs, std::memory_order_relaxed);
-        g_stats.D2hUs.fetch_add(d2hEventUs, std::memory_order_relaxed);
-        totalTransferWaitUs += h2dEventUs + d2hEventUs;
-        totalComputeWaitUs += kernelEventUs;
-        totalCompletionWaitUs += waitUs;
+        if (detailedTiming)
+        {
+            const uint64_t h2dEventUs = EventElapsedUs(ctx.H2dStartEvent, ctx.H2dStopEvent);
+            const uint64_t kernelEventUs = EventElapsedUs(ctx.KernelStartEvent, ctx.KernelStopEvent);
+            const uint64_t d2hEventUs = EventElapsedUs(ctx.D2hStartEvent, ctx.D2hStopEvent);
+            const uint64_t e2eEventUs = EventElapsedUs(ctx.E2eStartEvent, ctx.E2eStopEvent);
+            g_stats.H2dEventUs.fetch_add(h2dEventUs, std::memory_order_relaxed);
+            g_stats.KernelEventUs.fetch_add(kernelEventUs, std::memory_order_relaxed);
+            g_stats.D2hEventUs.fetch_add(d2hEventUs, std::memory_order_relaxed);
+            g_stats.E2eEventUs.fetch_add(e2eEventUs, std::memory_order_relaxed);
+            g_stats.H2dUs.fetch_add(h2dEventUs, std::memory_order_relaxed);
+            g_stats.KernelUs.fetch_add(kernelEventUs, std::memory_order_relaxed);
+            g_stats.D2hUs.fetch_add(d2hEventUs, std::memory_order_relaxed);
+            totalTransferWaitUs += h2dEventUs + d2hEventUs;
+            totalComputeWaitUs += kernelEventUs;
+        }
         if (launch.CopyOutput && usePinnedMemory && !launch.RegisteredOut && ctx.PinnedHost) {
             std::memcpy(launch.HostOutPtr, ctx.PinnedHost, launch.ByteCount);
         }

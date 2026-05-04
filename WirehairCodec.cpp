@@ -63,6 +63,31 @@ using namespace std;
 
 namespace wirehair {
 
+static inline void XorRowWords(
+    uint64_t* GF256_RESTRICT dest,
+    const uint64_t* GF256_RESTRICT src,
+    unsigned words)
+{
+    gf256_add_mem(dest, src, words * sizeof(uint64_t));
+}
+
+void Codec::SetSolverStage(SolverStage stage)
+{
+    _solver_stage = stage;
+    ++_solver_stage_epoch;
+}
+
+SolverStageSnapshot Codec::GetSolverStageSnapshot() const
+{
+    SolverStageSnapshot snap;
+    snap.Stage = _solver_stage;
+    snap.InputRows = _row_count;
+    snap.DenseCount = _dense_count;
+    snap.MixCount = _mix_count;
+    snap.StageEpoch = _solver_stage_epoch;
+    return snap;
+}
+
 
 //------------------------------------------------------------------------------
 // Stage (1) Peeling:
@@ -593,9 +618,7 @@ void Codec::PeelDiagonal()
             uint64_t * GF256_RESTRICT ge_ref_row = _compress_matrix + _ge_pitch * ref_row_i;
 
             // Add GE row to referencing GE row
-            for (unsigned j = 0; j < _ge_pitch; ++j) {
-                ge_ref_row[j] ^= ge_row[j];
-            }
+            XorRowWords(ge_ref_row, ge_row, _ge_pitch);
 
             PeelRow * GF256_RESTRICT ref_row = &_peel_rows[ref_row_i];
             const uint16_t ref_column_i = ref_row->Marks.Result.PeelColumn;
@@ -1111,9 +1134,7 @@ bool Codec::TriangleNonHeavy()
                     *rem_row ^= row0;
 
                     // Add the pivot row to eliminate the bit from this row, preserving previous bits
-                    for (unsigned ii = 1, end = _ge_pitch - word_offset; ii < end; ++ii) {
-                        rem_row[ii] ^= ge_row[ii];
-                    }
+                    XorRowWords(rem_row + 1, ge_row + 1, _ge_pitch - word_offset - 1);
                 }
             } // next remaining row
 
@@ -1246,9 +1267,7 @@ bool Codec::Triangle()
                     *rem_row ^= row0;
 
                     // Add the pivot row to eliminate the bit from this row, preserving previous bits
-                    for (unsigned ii = 1, end = _ge_pitch - word_offset; ii < end; ++ii) {
-                        rem_row[ii] ^= ge_row[ii];
-                    }
+                    XorRowWords(rem_row + 1, ge_row + 1, _ge_pitch - word_offset - 1);
                 }
             } // next remaining row
 
@@ -2954,11 +2973,13 @@ WirehairResult Codec::SolveMatrix()
 
 void Codec::GenerateRecoveryBlocks()
 {
+    SetSolverStage(SolverStage::Substitution);
     InitializeColumnValues();
     MultiplyDenseValues();
     AddSubdiagonalValues();
     BackSubstituteAboveDiagonal();
     Substitute();
+    SetSolverStage(SolverStage::None);
 }
 
 WirehairResult Codec::ResumeSolveMatrix(
@@ -3454,6 +3475,7 @@ WirehairResult Codec::ReconstructOutput(
     void * GF256_RESTRICT message_out,
     uint64_t message_bytes)
 {
+    SetSolverStage(SolverStage::Reconstruct);
     CAT_IF_DUMP(cout << endl << "---- ReconstructOutput ----" << endl << endl;)
 
     // Validate input
@@ -3581,6 +3603,7 @@ WirehairResult Codec::ReconstructOutput(
         CAT_IF_DUMP(cout << endl;)
     } // next row
 
+    SetSolverStage(SolverStage::None);
     return Wirehair_Success;
 }
 
@@ -4022,6 +4045,7 @@ WirehairResult Codec::EncodeFeed(const void * GF256_RESTRICT message_in)
     }
 
     // Solve matrix and generate recovery blocks
+    SetSolverStage(SolverStage::MatrixSetup);
     WirehairResult result = SolveMatrix();
 
     if (result == Wirehair_Success) {
@@ -4257,6 +4281,7 @@ WirehairResult Codec::DecodeFeed(
     const void * GF256_RESTRICT block_in,
     const unsigned block_bytes)
 {
+    SetSolverStage(SolverStage::DecodeFeed);
     // Validate input
     if (!block_in) {
         return Wirehair_InvalidInput;
@@ -4294,6 +4319,7 @@ WirehairResult Codec::DecodeFeed(
     if (row_i >= _block_count)
     {
         // Resume GE from this row
+        SetSolverStage(SolverStage::TriangleElimination);
         const WirehairResult result = ResumeSolveMatrix(block_id, block_in);
 
         if (result == Wirehair_Success) {

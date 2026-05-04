@@ -8,6 +8,20 @@ namespace wirehair {
 class Codec;
 }
 
+struct WirehairCudaSolverStageContract
+{
+    uint32_t stage = 0;
+    uint32_t input_rows = 0;
+    uint32_t dense_count = 0;
+    uint32_t mix_count = 0;
+    uint64_t epoch = 0;
+};
+
+bool WirehairCudaDispatchGetSolverStageContract(
+    wirehair::Codec* codec,
+    WirehairCudaSolverStageContract* contract_out
+);
+
 WirehairResult WirehairCudaDispatchEncode(
     wirehair::Codec* codec,
     unsigned blockId,

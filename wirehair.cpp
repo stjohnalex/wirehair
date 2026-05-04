@@ -53,6 +53,63 @@ static uint32_t NormalizeThreadCount(uint32_t requested)
     return hc > 0 ? static_cast<uint32_t>(hc) : 1U;
 }
 
+static bool ShouldUsePipelineCudaRuntime()
+{
+    WirehairCudaConfig cfg = {};
+    cfg.struct_bytes = sizeof(WirehairCudaConfig);
+    if (wirehair_cuda_get_config(&cfg) != Wirehair_Success) {
+        return false;
+    }
+    return cfg.enable_pipeline_cuda_runtime != 0U &&
+        cfg.backend_mode != WirehairCudaBackend_CpuOnly;
+}
+
+static size_t PipelineCoalesceLimit(size_t pendingQueue, uint32_t symbolsOrBlocks)
+{
+    WirehairCudaConfig cfg = {};
+    cfg.struct_bytes = sizeof(WirehairCudaConfig);
+    if (wirehair_cuda_get_config(&cfg) != Wirehair_Success) {
+        return 4;
+    }
+    size_t limit = 4;
+    if (cfg.enable_pipeline_cuda_runtime != 0U && cfg.backend_mode != WirehairCudaBackend_CpuOnly) {
+        limit = cfg.enable_cuda_graphs != 0U ? 12 : 8;
+        if (cfg.enable_single_api_microbatch != 0U) {
+            const size_t microbatch = static_cast<size_t>(cfg.single_api_microbatch_size > 0 ? cfg.single_api_microbatch_size : 1U);
+            limit = std::max<size_t>(limit, std::min<size_t>(16, microbatch));
+        }
+    }
+    limit = std::max<size_t>(2, std::min<size_t>(16, limit));
+    if (symbolsOrBlocks <= 128U) {
+        limit = std::min<size_t>(limit, 4);
+    } else if (symbolsOrBlocks <= 256U) {
+        limit = std::min<size_t>(limit, 8);
+    }
+    // Keep latency bounded when queue is shallow.
+    if (pendingQueue <= 2) {
+        limit = std::min<size_t>(limit, 3);
+    }
+    return limit;
+}
+
+static bool EncodeShapeCompatible(
+    const WirehairEncodeBatchRequest& a,
+    const WirehairEncodeBatchRequest& b)
+{
+    return a.message_bytes == b.message_bytes &&
+        a.block_bytes == b.block_bytes &&
+        a.block_stride_bytes == b.block_stride_bytes;
+}
+
+static bool DecodeShapeCompatible(
+    const WirehairDecodeBatchRequest& a,
+    const WirehairDecodeBatchRequest& b)
+{
+    return a.message_bytes == b.message_bytes &&
+        a.block_bytes == b.block_bytes &&
+        a.block_stride_bytes == b.block_stride_bytes;
+}
+
 class PipelineRuntime
 {
 public:
@@ -167,6 +224,9 @@ private:
         for (;;)
         {
             WirehairEncodeBatchRequest req = {};
+            std::vector<WirehairEncodeBatchRequest> coalesced;
+            bool useCudaRuntime = false;
+            size_t coalesceMax = 4;
             {
                 std::unique_lock<std::mutex> lock(QueueMutex);
                 EncodeQueueCv.wait(lock, [this]() {
@@ -177,6 +237,39 @@ private:
                 }
                 req = EncodeQueue.front();
                 EncodeQueue.pop_front();
+                useCudaRuntime = ShouldUsePipelineCudaRuntime();
+                if (useCudaRuntime)
+                {
+                    coalesceMax = PipelineCoalesceLimit(EncodeQueue.size(), req.block_count);
+                    while (!EncodeQueue.empty() && coalesced.size() + 1 < coalesceMax)
+                    {
+                        if (!EncodeShapeCompatible(req, EncodeQueue.front())) {
+                            break;
+                        }
+                        coalesced.push_back(EncodeQueue.front());
+                        EncodeQueue.pop_front();
+                    }
+                }
+            }
+
+            if (useCudaRuntime)
+            {
+                std::vector<WirehairEncodeBatchRequest> batch;
+                batch.reserve(coalesced.size() + 1);
+                batch.push_back(req);
+                for (const WirehairEncodeBatchRequest& item : coalesced) {
+                    batch.push_back(item);
+                }
+                for (const WirehairEncodeBatchRequest& job : batch)
+                {
+                    WirehairPipelineEvent completion = {};
+                    completion.request_id = job.request_id;
+                    completion.job_type = WirehairPipelineJob_EncodeBatch;
+                    completion.result = wirehair_cuda_encode_batch(&job);
+                    completion.produced_count = (completion.result == Wirehair_Success) ? job.block_count : 0;
+                    PushCompletion(completion);
+                }
+                continue;
             }
 
             WirehairPipelineEvent completion = {};
@@ -184,7 +277,6 @@ private:
             completion.job_type = WirehairPipelineJob_EncodeBatch;
             completion.result = Wirehair_Error;
             completion.produced_count = 0;
-
             WirehairCodec codec = wirehair_encoder_create(nullptr, req.message, req.message_bytes, req.block_bytes);
             if (codec)
             {
@@ -213,6 +305,9 @@ private:
         for (;;)
         {
             WirehairDecodeBatchRequest req = {};
+            std::vector<WirehairDecodeBatchRequest> coalesced;
+            bool useCudaRuntime = false;
+            size_t coalesceMax = 4;
             {
                 std::unique_lock<std::mutex> lock(QueueMutex);
                 DecodeQueueCv.wait(lock, [this]() {
@@ -223,6 +318,41 @@ private:
                 }
                 req = DecodeQueue.front();
                 DecodeQueue.pop_front();
+                useCudaRuntime = ShouldUsePipelineCudaRuntime();
+                if (useCudaRuntime)
+                {
+                    coalesceMax = PipelineCoalesceLimit(DecodeQueue.size(), req.symbol_count);
+                    while (!DecodeQueue.empty() && coalesced.size() + 1 < coalesceMax)
+                    {
+                        if (!DecodeShapeCompatible(req, DecodeQueue.front())) {
+                            break;
+                        }
+                        coalesced.push_back(DecodeQueue.front());
+                        DecodeQueue.pop_front();
+                    }
+                }
+            }
+
+            if (useCudaRuntime)
+            {
+                std::vector<WirehairDecodeBatchRequest> batch;
+                batch.reserve(coalesced.size() + 1);
+                batch.push_back(req);
+                for (const WirehairDecodeBatchRequest& item : coalesced) {
+                    batch.push_back(item);
+                }
+                for (const WirehairDecodeBatchRequest& job : batch)
+                {
+                    WirehairPipelineEvent completion = {};
+                    completion.request_id = job.request_id;
+                    completion.job_type = WirehairPipelineJob_DecodeBatch;
+                    completion.result = wirehair_cuda_decode_batch(&job);
+                    completion.produced_count =
+                        (completion.result == Wirehair_Success || completion.result == Wirehair_NeedMore)
+                        ? job.symbol_count : 0;
+                    PushCompletion(completion);
+                }
+                continue;
             }
 
             WirehairPipelineEvent completion = {};
@@ -230,7 +360,6 @@ private:
             completion.job_type = WirehairPipelineJob_DecodeBatch;
             completion.result = Wirehair_Error;
             completion.produced_count = 0;
-
             WirehairCodec decoder = wirehair_decoder_create(nullptr, req.message_bytes, req.block_bytes);
             if (decoder)
             {

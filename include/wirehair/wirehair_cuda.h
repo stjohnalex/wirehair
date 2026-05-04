@@ -31,6 +31,12 @@ typedef struct WirehairCudaConfig_t
     int32_t device_ordinal;
     uint32_t stream_count;
     uint32_t use_pinned_memory;
+    uint32_t enable_solver_offload;
+    uint32_t enable_pipeline_cuda_runtime;
+    uint32_t enable_cuda_graphs;
+    uint32_t enable_single_api_microbatch;
+    uint32_t single_api_microbatch_size;
+    uint32_t verification_level;
 } WirehairCudaConfig;
 
 typedef struct WirehairCudaPerfStats_t
@@ -60,6 +66,15 @@ typedef struct WirehairCudaPerfStats_t
     uint64_t completion_wait_us;
     uint64_t bytes_h2d;
     uint64_t bytes_d2h;
+    uint64_t decode_preprocess_us;
+    uint64_t decode_feed_us;
+    uint64_t decode_recover_us;
+    uint64_t solver_stage_us;
+    uint64_t solver_pivot_us;
+    uint64_t solver_eliminate_us;
+    uint64_t solver_backsub_us;
+    uint64_t solver_verify_passes;
+    uint64_t solver_verify_failures;
 } WirehairCudaPerfStats;
 
 WIREHAIR_EXPORT void wirehair_cuda_get_default_config(

@@ -297,6 +297,25 @@ struct PeelRefs
     uint16_t Rows[CAT_REF_LIST_MAX];
 };
 
+enum class SolverStage : uint8_t
+{
+    None = 0,
+    DecodeFeed = 1,
+    MatrixSetup = 2,
+    TriangleElimination = 3,
+    Substitution = 4,
+    Reconstruct = 5,
+};
+
+struct SolverStageSnapshot
+{
+    SolverStage Stage = SolverStage::None;
+    uint32_t InputRows = 0;
+    uint32_t DenseCount = 0;
+    uint32_t MixCount = 0;
+    uint64_t StageEpoch = 0;
+};
+
 
 //------------------------------------------------------------------------------
 // Codec
@@ -356,6 +375,9 @@ class Codec
 
     /// Number of bytes allocated for input, or 0 if referenced
     uint64_t _input_allocated = 0;
+
+    SolverStage _solver_stage = SolverStage::None;
+    uint64_t _solver_stage_epoch = 0;
 
 #if defined(CAT_ALL_ORIGINAL)
     /// Boolean: Only seen original data block identifiers
@@ -1231,6 +1253,7 @@ class Codec
 
     bool AllocateWorkspace();
     void FreeWorkspace();
+    void SetSolverStage(SolverStage stage);
 
 public:
     Codec();
@@ -1243,6 +1266,7 @@ public:
     GF256_FORCE_INLINE uint32_t PSeed() const { return _p_seed; }
     GF256_FORCE_INLINE uint32_t CSeed() const { return _d_seed; }
     GF256_FORCE_INLINE uint32_t BlockCount() const { return _block_count; }
+    SolverStageSnapshot GetSolverStageSnapshot() const;
 
 
     //--------------------------------------------------------------------------

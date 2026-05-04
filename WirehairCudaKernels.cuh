@@ -36,6 +36,10 @@ enum WirehairCudaCoreOp : uint32_t
     WirehairCudaCoreOp_None = 0,
     WirehairCudaCoreOp_EncodeParity = 1,
     WirehairCudaCoreOp_DecodeSolve = 2,
+    WirehairCudaCoreOp_SolverPivot = 3,
+    WirehairCudaCoreOp_SolverEliminate = 4,
+    WirehairCudaCoreOp_SolverBackSubstitute = 5,
+    WirehairCudaCoreOp_SolverPipeline = 6,
 };
 
 struct WirehairCudaCoreBatchParams
@@ -65,7 +69,11 @@ struct WirehairCudaCoreBatchResult
 
 bool WirehairCudaKernelProbe(uint32_t* deviceCountOut);
 bool WirehairCudaKernelEnableDevice(int32_t deviceOrdinal);
-bool WirehairCudaKernelConfigure(uint32_t streamCount, uint32_t usePinnedMemory);
+bool WirehairCudaKernelConfigure(
+    uint32_t streamCount,
+    uint32_t usePinnedMemory,
+    uint32_t enableCudaGraphs,
+    uint32_t verificationLevel);
 bool WirehairCudaKernelEncodeAssist(void* data, uint32_t bytes);
 bool WirehairCudaKernelDecodeAssist(const void* data, uint32_t bytes, uint32_t* checksumOut);
 bool WirehairCudaKernelXorInPlace(void* destData, const void* srcData, uint32_t bytes);

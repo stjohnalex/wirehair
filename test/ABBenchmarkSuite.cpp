@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -92,6 +93,11 @@ struct CoreCaseResult
     double AvgCreateUs = 0.0;
     double HostPackMB = 0.0;
     double HostPackUs = 0.0;
+    double CudaPreprocessUs = 0.0;
+    double CudaDecodeFeedUs = 0.0;
+    double CudaRecoverOnlyUs = 0.0;
+    uint32_t DifferentialChecks = 0;
+    uint32_t DifferentialMismatches = 0;
 };
 
 struct ParityCaseResult
@@ -128,6 +134,12 @@ struct StorageCaseResult
     double EffectiveReadBytesBeforeSuccess = 0.0;
     double WorkCompletionRatio = 0.0;
     std::string ModeProfile = "balanced";
+};
+
+struct StorageProfilesResult
+{
+    StorageCaseResult Isolated;
+    StorageCaseResult E2eCuda;
 };
 
 struct ThreadScalingResult
@@ -178,6 +190,13 @@ struct CudaPerfStatsResult
     double DeviceIdlePct = 0.0;
     double SymbolsPerSubmit = 0.0;
     double OverlapRatio = 0.0;
+    uint64_t SolverStageUs = 0;
+    uint64_t SolverPivotUs = 0;
+    uint64_t SolverEliminateUs = 0;
+    uint64_t SolverBackSubUs = 0;
+    uint64_t SolverVerifyPasses = 0;
+    uint64_t SolverVerifyFailures = 0;
+    double SolverKernelSharePct = 0.0;
 };
 
 static const char* CudaBackendName(uint32_t mode)
@@ -459,6 +478,13 @@ static CoreCaseResult RunCoreCase(
             const uint64_t selectedCount64 = static_cast<uint64_t>(selectedIds.size());
             encodeBytes += static_cast<uint64_t>(symbolCount) * blockBytes;
             decodeBytes += selectedCount64 * blockBytes;
+#if defined(AB_USE_CUDA)
+            WirehairCudaPerfStats statsBefore = {};
+            WirehairCudaPerfStats statsAfter = {};
+            statsBefore.struct_bytes = sizeof(WirehairCudaPerfStats);
+            statsAfter.struct_bytes = sizeof(WirehairCudaPerfStats);
+            const bool haveStatsBefore = (wirehair_cuda_get_perf_stats(&statsBefore) == Wirehair_Success);
+#endif
             const uint64_t d0 = NowUs();
             WirehairDecodeBatchRequest decReq = {};
             decReq.request_id = 2;
@@ -473,16 +499,74 @@ static CoreCaseResult RunCoreCase(
             const WirehairResult decResult = wirehair_cuda_decode_batch(&decReq);
             const uint64_t d1 = NowUs();
             decodeUs += (d1 - d0);
+#if defined(AB_USE_CUDA)
+            const bool haveStatsAfter = (wirehair_cuda_get_perf_stats(&statsAfter) == Wirehair_Success);
+            uint64_t preprocessUs = 0;
+            uint64_t feedUs = 0;
+            uint64_t recoverOnlyUs = 0;
+            if (haveStatsBefore && haveStatsAfter)
+            {
+                if (statsAfter.decode_preprocess_us >= statsBefore.decode_preprocess_us) {
+                    preprocessUs = statsAfter.decode_preprocess_us - statsBefore.decode_preprocess_us;
+                }
+                if (statsAfter.decode_feed_us >= statsBefore.decode_feed_us) {
+                    feedUs = statsAfter.decode_feed_us - statsBefore.decode_feed_us;
+                }
+                if (statsAfter.decode_recover_us >= statsBefore.decode_recover_us) {
+                    recoverOnlyUs = statsAfter.decode_recover_us - statsBefore.decode_recover_us;
+                }
+            }
+            r.CudaPreprocessUs += static_cast<double>(preprocessUs);
+            r.CudaDecodeFeedUs += static_cast<double>(feedUs);
+            r.CudaRecoverOnlyUs += static_cast<double>(recoverOnlyUs);
+#endif
             if (decResult == Wirehair_Success &&
                 HashBytes(&recovered[0], recovered.size()) == HashBytes(&message[0], message.size()))
             {
+#if defined(AB_USE_CUDA)
+                if (haveStatsBefore && haveStatsAfter && recoverOnlyUs > 0) {
+                    recoverUs += recoverOnlyUs;
+                } else {
+                    recoverUs += (d1 - d0);
+                }
+#else
                 recoverUs += (d1 - d0);
+#endif
                 ++r.Successes;
                 const uint32_t needed = static_cast<uint32_t>(selectedIds.size());
                 if (needed > N) {
                     extraSum += (needed - N);
                 }
                 recoverBytes += messageBytes;
+
+                // Differential harness: compare CUDA decode output against CPU decode path
+                // on deterministic first-trial replay per case.
+                if (t == 0)
+                {
+                    std::vector<uint8_t> cpuRecovered(static_cast<size_t>(messageBytes), 0);
+                    WirehairCodec cpuDecoder = wirehair_decoder_create(nullptr, messageBytes, blockBytes);
+                    bool cpuOk = false;
+                    if (cpuDecoder)
+                    {
+                        for (uint32_t di = 0; di < static_cast<uint32_t>(selectedIds.size()); ++di)
+                        {
+                            const uint8_t* symbol = &decodeInput[static_cast<size_t>(di) * blockBytes];
+                            const WirehairResult cpuDec = wirehair_decode(cpuDecoder, selectedIds[di], symbol, decodeLens[di]);
+                            if (cpuDec == Wirehair_Success) {
+                                cpuOk = (wirehair_recover(cpuDecoder, &cpuRecovered[0], messageBytes) == Wirehair_Success);
+                                break;
+                            }
+                            if (cpuDec != Wirehair_NeedMore) {
+                                break;
+                            }
+                        }
+                        wirehair_free(cpuDecoder);
+                    }
+                    ++r.DifferentialChecks;
+                    if (!cpuOk || HashBytes(&cpuRecovered[0], cpuRecovered.size()) != HashBytes(&recovered[0], recovered.size())) {
+                        ++r.DifferentialMismatches;
+                    }
+                }
             }
             continue;
         }
@@ -754,6 +838,16 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
     const uint32_t totalSymbols = N + 32;
     std::vector<uint8_t> message(static_cast<size_t>(messageBytes));
     FillRandom(message, prng);
+#if defined(AB_USE_CUDA)
+    bool useCudaStoragePath = true;
+    WirehairCudaConfig activeCfg = {};
+    activeCfg.struct_bytes = sizeof(WirehairCudaConfig);
+    if (wirehair_cuda_get_config(&activeCfg) == Wirehair_Success) {
+        useCudaStoragePath = (activeCfg.backend_mode != WirehairCudaBackend_CpuOnly);
+    }
+#else
+    const bool useCudaStoragePath = false;
+#endif
 
     uint64_t writeUs = 0;
     uint64_t readUs = 0;
@@ -762,8 +856,8 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
     uint64_t neededSum = 0;
     uint64_t writeBatchCount = 0;
     uint64_t readBatchCount = 0;
-    const uint32_t writeBatchSymbols = highMemoryMode ? 256U : 64U;
-    const uint32_t readBatchSymbols = highMemoryMode ? 256U : 64U;
+    const uint32_t writeBatchSymbols = highMemoryMode ? 384U : 128U;
+    const uint32_t readBatchSymbols = highMemoryMode ? 384U : 128U;
     std::vector<double> writeLatencyMs;
     std::vector<double> readLatencyMs;
     writeLatencyMs.reserve(static_cast<size_t>(trials) * totalSymbols);
@@ -777,39 +871,50 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
         const std::string trialDir = JoinPath(root, "trial-" + std::to_string(t));
         EnsureDirectory(trialDir);
 
-        WirehairCodec encoder = wirehair_encoder_create(nullptr, &message[0], messageBytes, blockBytes);
-        WirehairCodec decoder = wirehair_decoder_create(nullptr, messageBytes, blockBytes);
-        if (!encoder || !decoder) {
-            if (encoder) {
-                wirehair_free(encoder);
-            }
-            if (decoder) {
-                wirehair_free(decoder);
-            }
-            continue;
-        }
-
-        std::vector<uint32_t> symbolIds;
-        std::vector<uint32_t> symbolLens;
+        std::vector<uint32_t> symbolIds(totalSymbols, 0);
+        std::vector<uint32_t> symbolLens(totalSymbols, 0);
         std::vector<uint8_t> encodedSlab(static_cast<size_t>(totalSymbols) * blockBytes, 0);
-        symbolIds.reserve(totalSymbols);
-        symbolLens.reserve(totalSymbols);
 
-        for (uint32_t i = 0; i < totalSymbols; ++i)
+        if (useCudaStoragePath)
         {
-            const uint32_t blockId = N + i;
-            uint8_t* symbol = &encodedSlab[static_cast<size_t>(i) * blockBytes];
-            uint32_t writeLen = 0;
-            if (wirehair_encode(encoder, blockId, symbol, blockBytes, &writeLen) != Wirehair_Success) {
+            WirehairEncodeBatchRequest encReq = {};
+            encReq.request_id = static_cast<uint64_t>(t + 1);
+            encReq.message = &message[0];
+            encReq.message_bytes = messageBytes;
+            encReq.block_bytes = blockBytes;
+            encReq.start_block_id = N;
+            encReq.block_count = totalSymbols;
+            encReq.block_data_out = &encodedSlab[0];
+            encReq.block_stride_bytes = blockBytes;
+            encReq.bytes_out = &symbolLens[0];
+            if (wirehair_cuda_encode_batch(&encReq) != Wirehair_Success) {
                 continue;
             }
-            symbolIds.push_back(blockId);
-            symbolLens.push_back(writeLen);
         }
-        if (symbolIds.empty()) {
-            wirehair_free(decoder);
-            wirehair_free(encoder);
-            continue;
+        else
+        {
+            WirehairCodec codec = wirehair_encoder_create(nullptr, &message[0], messageBytes, blockBytes);
+            if (!codec) {
+                continue;
+            }
+            bool encodeOk = true;
+            for (uint32_t i = 0; i < totalSymbols; ++i)
+            {
+                uint8_t* output = &encodedSlab[static_cast<size_t>(i) * blockBytes];
+                uint32_t written = 0;
+                if (wirehair_encode(codec, N + i, output, blockBytes, &written) != Wirehair_Success || written == 0) {
+                    encodeOk = false;
+                    break;
+                }
+                symbolLens[i] = written;
+            }
+            wirehair_free(codec);
+            if (!encodeOk) {
+                continue;
+            }
+        }
+        for (uint32_t i = 0; i < totalSymbols; ++i) {
+            symbolIds[i] = N + i;
         }
 
         std::vector<uint32_t> shuffledWrite(static_cast<uint32_t>(symbolIds.size()), 0);
@@ -824,10 +929,10 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
         const std::string packPath = JoinPath(trialDir, "symbols.pack");
         std::fstream rw(packPath.c_str(), std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
         if (!rw) {
-            wirehair_free(decoder);
-            wirehair_free(encoder);
             continue;
         }
+        std::vector<char> ioBuffer(highMemoryMode ? (8U * 1024U * 1024U) : (2U * 1024U * 1024U), 0);
+        rw.rdbuf()->pubsetbuf(ioBuffer.data(), static_cast<std::streamsize>(ioBuffer.size()));
         const size_t fileBytes = symbolIds.size() * static_cast<size_t>(blockBytes);
         if (fileBytes > 0) {
             rw.seekp(static_cast<std::streamoff>(fileBytes - 1), std::ios::beg);
@@ -836,23 +941,16 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
             rw.flush();
         }
 
-        std::vector<uint8_t> writeBatchBuffer(static_cast<size_t>(writeBatchSymbols) * blockBytes, 0);
         for (size_t start = 0; start < shuffledWrite.size(); start += writeBatchSymbols)
         {
             const size_t count = std::min<size_t>(writeBatchSymbols, shuffledWrite.size() - start);
             for (size_t i = 0; i < count; ++i)
             {
                 const uint32_t sourceIndex = shuffledWrite[start + i];
-                const uint8_t* src = &encodedSlab[static_cast<size_t>(sourceIndex) * blockBytes];
-                std::memcpy(&writeBatchBuffer[i * blockBytes], src, blockBytes);
-            }
-            for (size_t i = 0; i < count; ++i)
-            {
-                const uint32_t sourceIndex = shuffledWrite[start + i];
                 const std::streamoff offset = static_cast<std::streamoff>(sourceIndex) * blockBytes;
                 const uint64_t w0 = NowUs();
                 rw.seekp(offset, std::ios::beg);
-                rw.write(reinterpret_cast<const char*>(&writeBatchBuffer[i * blockBytes]), blockBytes);
+                rw.write(reinterpret_cast<const char*>(&encodedSlab[static_cast<size_t>(sourceIndex) * blockBytes]), blockBytes);
                 const uint64_t w1 = NowUs();
                 if (!rw) {
                     break;
@@ -869,7 +967,10 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
         uint32_t needed = 0;
         std::vector<uint8_t> recovered(message.size());
         bool ok = false;
+        bool decodeHardFail = false;
         uint64_t trialReadBytes = 0;
+        uint64_t readBytesAtSuccess = 0;
+        bool capturedReadBytesAtSuccess = false;
         std::vector<uint32_t> shuffledRead = shuffledWrite;
         for (size_t i = shuffledRead.size(); i > 1; --i) {
             const size_t j = prng.NextBounded(static_cast<uint32_t>(i));
@@ -877,41 +978,146 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
         }
         if (rw)
         {
-            std::vector<uint8_t> readBatchBuffer(static_cast<size_t>(readBatchSymbols) * blockBytes, 0);
-            for (size_t start = 0; start < shuffledRead.size() && !ok; start += readBatchSymbols)
+            struct ReadBatch
+            {
+                bool Ok = true;
+                std::vector<uint32_t> SourceIndices;
+                std::vector<uint8_t> Data;
+                std::vector<double> LatenciesMs;
+                uint64_t ReadUs = 0;
+                uint64_t Bytes = 0;
+                uint64_t AttemptedBytes = 0;
+            };
+            std::vector<uint32_t> decodeIds;
+            std::vector<uint32_t> decodeLens;
+            std::vector<uint8_t> decodeSlab(static_cast<size_t>(totalSymbols) * blockBytes, 0);
+            decodeIds.reserve(totalSymbols);
+            decodeLens.reserve(totalSymbols);
+            uint32_t decodeCount = 0;
+            auto ReadBatchAsync = [&](size_t start) -> ReadBatch
             {
                 const size_t count = std::min<size_t>(readBatchSymbols, shuffledRead.size() - start);
-                for (size_t i = 0; i < count && !ok; ++i)
+                ReadBatch batch = {};
+                batch.SourceIndices.reserve(count);
+                batch.Data.resize(count * static_cast<size_t>(blockBytes), 0);
+                batch.LatenciesMs.reserve(count);
+                for (size_t i = 0; i < count; ++i)
                 {
                     const uint32_t sourceIndex = shuffledRead[start + i];
-                    const uint32_t blockId = symbolIds[sourceIndex];
                     const std::streamoff offset = static_cast<std::streamoff>(sourceIndex) * blockBytes;
+                    uint8_t* symbol = &batch.Data[i * static_cast<size_t>(blockBytes)];
                     const uint64_t r0 = NowUs();
                     rw.seekg(offset, std::ios::beg);
-                    const uint8_t* symbol = &readBatchBuffer[i * blockBytes];
-                    rw.read(reinterpret_cast<char*>(&readBatchBuffer[i * blockBytes]), blockBytes);
+                    rw.read(reinterpret_cast<char*>(symbol), blockBytes);
                     const uint64_t r1 = NowUs();
                     const std::streamsize got = rw.gcount();
                     if (got <= 0) {
+                        batch.Ok = false;
                         break;
                     }
-                    readLatencyMs.push_back(static_cast<double>(r1 - r0) / 1000.0);
-                    ++readBatchCount;
-                    readUs += (r1 - r0);
-                    bytesR += static_cast<uint64_t>(got);
-                    attemptedReadBytesTotal += static_cast<uint64_t>(got);
-                    trialReadBytes += static_cast<uint64_t>(got);
-                    ++needed;
-                    const WirehairResult dr = wirehair_decode(decoder, blockId, symbol, symbolLens[sourceIndex]);
-                    if (dr == Wirehair_Success) {
-                        if (wirehair_recover(decoder, &recovered[0], messageBytes) == Wirehair_Success &&
+                    batch.SourceIndices.push_back(sourceIndex);
+                    batch.LatenciesMs.push_back(static_cast<double>(r1 - r0) / 1000.0);
+                    batch.ReadUs += (r1 - r0);
+                    batch.Bytes += static_cast<uint64_t>(got);
+                    batch.AttemptedBytes += static_cast<uint64_t>(got);
+                }
+                batch.Data.resize(batch.SourceIndices.size() * static_cast<size_t>(blockBytes));
+                return batch;
+            };
+
+            size_t nextStart = 0;
+            std::future<ReadBatch> pendingRead = std::async(std::launch::async, ReadBatchAsync, nextStart);
+            nextStart += readBatchSymbols;
+
+            while (pendingRead.valid() && !ok && !decodeHardFail)
+            {
+                ReadBatch batch = pendingRead.get();
+                if (nextStart < shuffledRead.size()) {
+                    pendingRead = std::async(std::launch::async, ReadBatchAsync, nextStart);
+                    nextStart += readBatchSymbols;
+                }
+
+                if (!batch.Ok) {
+                    break;
+                }
+
+                for (double latency : batch.LatenciesMs) {
+                    readLatencyMs.push_back(latency);
+                }
+                readBatchCount += batch.SourceIndices.size();
+                readUs += batch.ReadUs;
+                bytesR += batch.Bytes;
+                attemptedReadBytesTotal += batch.AttemptedBytes;
+                trialReadBytes += batch.Bytes;
+
+                if (!ok)
+                {
+                    for (size_t i = 0; i < batch.SourceIndices.size(); ++i)
+                    {
+                        const uint32_t sourceIndex = batch.SourceIndices[i];
+                        const uint32_t blockId = symbolIds[sourceIndex];
+                        uint8_t* symbolDest = &decodeSlab[static_cast<size_t>(decodeCount) * blockBytes];
+                        const uint8_t* symbolSrc = &batch.Data[i * static_cast<size_t>(blockBytes)];
+                        std::memcpy(symbolDest, symbolSrc, blockBytes);
+                        ++needed;
+                        decodeIds.push_back(blockId);
+                        decodeLens.push_back(symbolLens[sourceIndex]);
+                        ++decodeCount;
+                    }
+
+                    if (decodeCount >= N)
+                    {
+                    WirehairResult dr = Wirehair_Error;
+                    if (useCudaStoragePath)
+                    {
+                        WirehairDecodeBatchRequest decReq = {};
+                        decReq.request_id = static_cast<uint64_t>(t + 1);
+                        decReq.message_bytes = messageBytes;
+                        decReq.block_bytes = blockBytes;
+                        decReq.block_ids = &decodeIds[0];
+                        decReq.block_data = &decodeSlab[0];
+                        decReq.block_data_bytes = &decodeLens[0];
+                        decReq.symbol_count = decodeCount;
+                        decReq.block_stride_bytes = blockBytes;
+                        decReq.message_out = &recovered[0];
+                        dr = wirehair_cuda_decode_batch(&decReq);
+                    }
+                    else
+                    {
+                        WirehairCodec decoder = wirehair_decoder_create(nullptr, messageBytes, blockBytes);
+                        if (!decoder) {
+                            dr = Wirehair_Error;
+                        } else {
+                            dr = Wirehair_NeedMore;
+                            for (uint32_t si = 0; si < decodeCount; ++si)
+                            {
+                                const uint8_t* symbol = &decodeSlab[static_cast<size_t>(si) * blockBytes];
+                                const WirehairResult feed = wirehair_decode(decoder, decodeIds[si], symbol, decodeLens[si]);
+                                if (feed == Wirehair_Success) {
+                                    dr = wirehair_recover(decoder, &recovered[0], messageBytes);
+                                    break;
+                                }
+                                if (feed != Wirehair_NeedMore) {
+                                    dr = feed;
+                                    break;
+                                }
+                            }
+                            wirehair_free(decoder);
+                        }
+                    }
+                        if (dr == Wirehair_Success &&
                             HashBytes(&recovered[0], recovered.size()) == HashBytes(&message[0], message.size()))
                         {
                             ok = true;
+                            if (!capturedReadBytesAtSuccess) {
+                                readBytesAtSuccess = trialReadBytes;
+                                capturedReadBytesAtSuccess = true;
+                            }
                         }
-                    }
-                    if (dr != Wirehair_NeedMore && dr != Wirehair_Success) {
-                        break;
+                        else if (dr != Wirehair_NeedMore && dr != Wirehair_Success)
+                        {
+                            decodeHardFail = true;
+                        }
                     }
                 }
             }
@@ -919,11 +1125,9 @@ static StorageCaseResult RunStorageCase(uint32_t trials, const std::string& root
         if (ok) {
             ++r.Successes;
             neededSum += needed;
-            successfulReadBytesTotal += trialReadBytes;
+            successfulReadBytesTotal += capturedReadBytesAtSuccess ? readBytesAtSuccess : trialReadBytes;
         }
 
-        wirehair_free(decoder);
-        wirehair_free(encoder);
     }
 
     r.WriteMBps = writeUs > 0 ? static_cast<double>(bytesW) / writeUs : 0.0;
@@ -1082,13 +1286,34 @@ static ThreadScalingResult RunThreadScalingCase(uint32_t threads, uint32_t trial
     return r;
 }
 
+static void WriteStorageJson(std::ostream& out, const StorageCaseResult& storage)
+{
+    out << "\"trials\":" << storage.Trials
+        << ",\"successes\":" << storage.Successes
+        << ",\"success_rate\":" << (storage.Trials > 0 ? static_cast<double>(storage.Successes) / storage.Trials : 0.0)
+        << ",\"write_mbps\":" << storage.WriteMBps
+        << ",\"read_mbps\":" << storage.ReadMBps
+        << ",\"avg_needed\":" << storage.AvgNeeded
+        << ",\"write_batch_count\":" << storage.WriteBatchCount
+        << ",\"read_batch_count\":" << storage.ReadBatchCount
+        << ",\"avg_write_batch_bytes\":" << storage.AvgWriteBatchBytes
+        << ",\"avg_read_batch_bytes\":" << storage.AvgReadBatchBytes
+        << ",\"random_write_p50_ms\":" << storage.RandomWriteP50Ms
+        << ",\"random_write_p95_ms\":" << storage.RandomWriteP95Ms
+        << ",\"random_read_p50_ms\":" << storage.RandomReadP50Ms
+        << ",\"random_read_p95_ms\":" << storage.RandomReadP95Ms
+        << ",\"effective_read_bytes_before_success\":" << storage.EffectiveReadBytesBeforeSuccess
+        << ",\"work_completion_ratio\":" << storage.WorkCompletionRatio
+        << ",\"mode_profile\":\"" << storage.ModeProfile << "\"";
+}
+
 static void WriteJson(
     const std::string& path,
     const Config& cfg,
     const std::vector<CoreCaseResult>& core,
     const std::vector<ParityCaseResult>& parity,
     const std::vector<ChurnCaseResult>& churn,
-    const StorageCaseResult& storage,
+    const StorageProfilesResult& storageProfiles,
     const std::vector<ThreadScalingResult>& threadScaling,
     const CudaPerfStatsResult& cudaStats)
 {
@@ -1118,6 +1343,11 @@ static void WriteJson(
             << ",\"avg_create_us\":" << c.AvgCreateUs
             << ",\"host_pack_mb\":" << c.HostPackMB
             << ",\"host_pack_us\":" << c.HostPackUs
+            << ",\"cuda_preprocess_us\":" << (c.Trials > 0 ? (c.CudaPreprocessUs / c.Trials) : 0.0)
+            << ",\"cuda_decode_feed_us\":" << (c.Trials > 0 ? (c.CudaDecodeFeedUs / c.Trials) : 0.0)
+            << ",\"cuda_recover_only_us\":" << (c.Trials > 0 ? (c.CudaRecoverOnlyUs / c.Trials) : 0.0)
+            << ",\"differential_checks\":" << c.DifferentialChecks
+            << ",\"differential_mismatches\":" << c.DifferentialMismatches
             << "}";
         if (i + 1 < core.size()) {
             out << ",";
@@ -1160,25 +1390,16 @@ static void WriteJson(
     }
     out << "  ],\n";
 
+    // Backward-compatible primary storage payload remains storage_isolated.
     out << "  \"storage\": {";
-    out << "\"trials\":" << storage.Trials
-        << ",\"successes\":" << storage.Successes
-        << ",\"success_rate\":" << (storage.Trials > 0 ? static_cast<double>(storage.Successes) / storage.Trials : 0.0)
-        << ",\"write_mbps\":" << storage.WriteMBps
-        << ",\"read_mbps\":" << storage.ReadMBps
-        << ",\"avg_needed\":" << storage.AvgNeeded
-        << ",\"write_batch_count\":" << storage.WriteBatchCount
-        << ",\"read_batch_count\":" << storage.ReadBatchCount
-        << ",\"avg_write_batch_bytes\":" << storage.AvgWriteBatchBytes
-        << ",\"avg_read_batch_bytes\":" << storage.AvgReadBatchBytes
-        << ",\"random_write_p50_ms\":" << storage.RandomWriteP50Ms
-        << ",\"random_write_p95_ms\":" << storage.RandomWriteP95Ms
-        << ",\"random_read_p50_ms\":" << storage.RandomReadP50Ms
-        << ",\"random_read_p95_ms\":" << storage.RandomReadP95Ms
-        << ",\"effective_read_bytes_before_success\":" << storage.EffectiveReadBytesBeforeSuccess
-        << ",\"work_completion_ratio\":" << storage.WorkCompletionRatio
-        << ",\"mode_profile\":\"" << storage.ModeProfile << "\""
-        << "},\n";
+    WriteStorageJson(out, storageProfiles.Isolated);
+    out << "},\n";
+    out << "  \"storage_profiles\": {";
+    out << "\"storage_isolated\":{";
+    WriteStorageJson(out, storageProfiles.Isolated);
+    out << "},\"storage_e2e_cuda\":{";
+    WriteStorageJson(out, storageProfiles.E2eCuda);
+    out << "}},\n";
 
     out << "  \"thread_scaling\": [\n";
     for (size_t i = 0; i < threadScaling.size(); ++i)
@@ -1235,6 +1456,13 @@ static void WriteJson(
         << ",\"device_idle_pct\":" << cudaStats.DeviceIdlePct
         << ",\"symbols_per_submit\":" << cudaStats.SymbolsPerSubmit
         << ",\"overlap_ratio\":" << cudaStats.OverlapRatio
+        << ",\"solver_stage_us\":" << cudaStats.SolverStageUs
+        << ",\"solver_pivot_us\":" << cudaStats.SolverPivotUs
+        << ",\"solver_eliminate_us\":" << cudaStats.SolverEliminateUs
+        << ",\"solver_backsub_us\":" << cudaStats.SolverBackSubUs
+        << ",\"solver_verify_passes\":" << cudaStats.SolverVerifyPasses
+        << ",\"solver_verify_failures\":" << cudaStats.SolverVerifyFailures
+        << ",\"solver_kernel_share_pct\":" << cudaStats.SolverKernelSharePct
         << "}\n";
 
     out << "}\n";
@@ -1244,7 +1472,7 @@ static void PrintSummary(
     const std::vector<CoreCaseResult>& core,
     const std::vector<ParityCaseResult>& parity,
     const std::vector<ChurnCaseResult>& churn,
-    const StorageCaseResult& storage,
+    const StorageProfilesResult& storageProfiles,
     const std::vector<ThreadScalingResult>& threadScaling,
     const CudaPerfStatsResult& cudaStats)
 {
@@ -1290,9 +1518,11 @@ static void PrintSummary(
             << std::endl;
     }
 
+    const StorageCaseResult& storage = storageProfiles.Isolated;
+    const StorageCaseResult& storageE2e = storageProfiles.E2eCuda;
     const double storageRate = storage.Trials > 0 ? static_cast<double>(storage.Successes) / storage.Trials : 0.0;
     std::cout
-        << "-- Storage case -- success_rate=" << std::fixed << std::setprecision(3) << storageRate
+        << "-- Storage case (isolated) -- success_rate=" << std::fixed << std::setprecision(3) << storageRate
         << " write_MBps=" << std::setprecision(2) << storage.WriteMBps
         << " read_MBps=" << storage.ReadMBps
         << " avg_needed=" << storage.AvgNeeded
@@ -1307,6 +1537,24 @@ static void PrintSummary(
         << " eff_read_bytes=" << storage.EffectiveReadBytesBeforeSuccess
         << " completion_ratio=" << storage.WorkCompletionRatio
         << " mode_profile=" << storage.ModeProfile
+        << std::endl;
+    const double storageE2eRate = storageE2e.Trials > 0 ? static_cast<double>(storageE2e.Successes) / storageE2e.Trials : 0.0;
+    std::cout
+        << "-- Storage case (e2e_cuda) -- success_rate=" << std::fixed << std::setprecision(3) << storageE2eRate
+        << " write_MBps=" << std::setprecision(2) << storageE2e.WriteMBps
+        << " read_MBps=" << storageE2e.ReadMBps
+        << " avg_needed=" << storageE2e.AvgNeeded
+        << " write_batches=" << storageE2e.WriteBatchCount
+        << " read_batches=" << storageE2e.ReadBatchCount
+        << " avg_write_batch_bytes=" << storageE2e.AvgWriteBatchBytes
+        << " avg_read_batch_bytes=" << storageE2e.AvgReadBatchBytes
+        << " rnd_w_p50_ms=" << storageE2e.RandomWriteP50Ms
+        << " rnd_w_p95_ms=" << storageE2e.RandomWriteP95Ms
+        << " rnd_r_p50_ms=" << storageE2e.RandomReadP50Ms
+        << " rnd_r_p95_ms=" << storageE2e.RandomReadP95Ms
+        << " eff_read_bytes=" << storageE2e.EffectiveReadBytesBeforeSuccess
+        << " completion_ratio=" << storageE2e.WorkCompletionRatio
+        << " mode_profile=" << storageE2e.ModeProfile
         << std::endl;
 
     std::cout << "-- Thread scaling --" << std::endl;
@@ -1348,6 +1596,13 @@ static void PrintSummary(
                   << " avg_bytes_per_call=" << cudaStats.AvgBytesPerCall
                   << " bytes_h2d=" << cudaStats.BytesH2d
                   << " bytes_d2h=" << cudaStats.BytesD2h
+                  << " solver_stage_us=" << cudaStats.SolverStageUs
+                  << " solver_pivot_us=" << cudaStats.SolverPivotUs
+                  << " solver_eliminate_us=" << cudaStats.SolverEliminateUs
+                  << " solver_backsub_us=" << cudaStats.SolverBackSubUs
+                  << " solver_verify_passes=" << cudaStats.SolverVerifyPasses
+                  << " solver_verify_failures=" << cudaStats.SolverVerifyFailures
+                  << " solver_kernel_share_pct=" << cudaStats.SolverKernelSharePct
                   << std::endl;
     }
 }
@@ -1407,6 +1662,12 @@ int main(int argc, char** argv)
     WirehairCudaConfig cudaConfig = {};
     wirehair_cuda_get_default_config(&cudaConfig);
     cudaConfig.backend_mode = cfg.CudaBackendMode;
+    cudaConfig.enable_solver_offload = cfg.CoreUseCudaBatch ? 1U : 0U;
+    cudaConfig.enable_pipeline_cuda_runtime = 1U;
+    cudaConfig.enable_cuda_graphs = cfg.CoreUseCudaBatch ? 1U : 0U;
+    cudaConfig.enable_single_api_microbatch = 1U;
+    cudaConfig.single_api_microbatch_size = cfg.CudaHighMemory ? 32U : 8U;
+    cudaConfig.verification_level = 1U;
     if (availability == Wirehair_Success && cudaDevices > 0) {
         if (cfg.CudaHighMemory) {
             cudaConfig.stream_count = std::min<uint32_t>(16, std::max<uint32_t>(8, cudaDevices * 4));
@@ -1418,6 +1679,10 @@ int main(int argc, char** argv)
         << "[ab_benchmark_cuda] config "
         << "stream_count=" << cudaConfig.stream_count
         << " pinned=" << cudaConfig.use_pinned_memory
+        << " solver_offload=" << cudaConfig.enable_solver_offload
+        << " pipeline_cuda_runtime=" << cudaConfig.enable_pipeline_cuda_runtime
+        << " cuda_graphs=" << cudaConfig.enable_cuda_graphs
+        << " single_api_microbatch=" << cudaConfig.enable_single_api_microbatch
         << std::endl;
     if (wirehair_cuda_set_config(&cudaConfig) != Wirehair_Success) {
         std::cerr << "wirehair_cuda_set_config failed" << std::endl;
@@ -1503,7 +1768,7 @@ int main(int argc, char** argv)
         churn[i] = RunChurnCase(churnTargets[i], cfg.Trials, cfg.Seed + (i * 71ULL));
     });
 
-    StorageCaseResult storage = {};
+    StorageProfilesResult storageProfiles = {};
 #if defined(AB_USE_CUDA)
     WirehairCudaConfig storageSavedConfig = {};
     storageSavedConfig.struct_bytes = sizeof(WirehairCudaConfig);
@@ -1515,12 +1780,28 @@ int main(int argc, char** argv)
         storageCpuConfig.struct_bytes = sizeof(WirehairCudaConfig);
         wirehair_cuda_set_config(&storageCpuConfig);
     }
-    storage = RunStorageCase(cfg.Trials, JoinPath(cfg.IoRoot, AB_VARIANT_NAME), cfg.Seed, cfg.CudaHighMemory);
+    storageProfiles.Isolated = RunStorageCase(
+        cfg.Trials,
+        JoinPath(JoinPath(cfg.IoRoot, AB_VARIANT_NAME), "storage_isolated"),
+        cfg.Seed,
+        cfg.CudaHighMemory);
     if (hasCudaConfig) {
         wirehair_cuda_set_config(&storageSavedConfig);
+        storageProfiles.E2eCuda = RunStorageCase(
+            cfg.Trials,
+            JoinPath(JoinPath(cfg.IoRoot, AB_VARIANT_NAME), "storage_e2e_cuda"),
+            cfg.Seed + 0x9e37ULL,
+            cfg.CudaHighMemory);
+    } else {
+        storageProfiles.E2eCuda = storageProfiles.Isolated;
     }
 #else
-    storage = RunStorageCase(cfg.Trials, JoinPath(cfg.IoRoot, AB_VARIANT_NAME), cfg.Seed, cfg.CudaHighMemory);
+    storageProfiles.Isolated = RunStorageCase(
+        cfg.Trials,
+        JoinPath(JoinPath(cfg.IoRoot, AB_VARIANT_NAME), "storage_isolated"),
+        cfg.Seed,
+        cfg.CudaHighMemory);
+    storageProfiles.E2eCuda = storageProfiles.Isolated;
 #endif
     std::vector<ThreadScalingResult> scaling;
     const uint32_t requestedThreads[] = {1, 2, 4, 8, 16};
@@ -1571,6 +1852,12 @@ int main(int argc, char** argv)
         cudaStats.CompletionWaitUs = stats.completion_wait_us;
         cudaStats.BytesH2d = stats.bytes_h2d;
         cudaStats.BytesD2h = stats.bytes_d2h;
+        cudaStats.SolverStageUs = stats.solver_stage_us;
+        cudaStats.SolverPivotUs = stats.solver_pivot_us;
+        cudaStats.SolverEliminateUs = stats.solver_eliminate_us;
+        cudaStats.SolverBackSubUs = stats.solver_backsub_us;
+        cudaStats.SolverVerifyPasses = stats.solver_verify_passes;
+        cudaStats.SolverVerifyFailures = stats.solver_verify_failures;
         cudaStats.CoreOffloadCalls = stats.encode_calls + stats.decode_calls;
         const uint64_t transferSyncUs = stats.h2d_event_us + stats.d2h_event_us;
         const uint64_t totalObservedUs = transferSyncUs + stats.kernel_event_us;
@@ -1608,13 +1895,17 @@ int main(int argc, char** argv)
         if (cudaStats.OverlapRatio > 1.0) {
             cudaStats.OverlapRatio = 1.0;
         }
+        if (cudaStats.KernelUs > 0) {
+            cudaStats.SolverKernelSharePct =
+                (100.0 * static_cast<double>(stats.solver_stage_us)) / static_cast<double>(cudaStats.KernelUs);
+        }
     }
 #endif
 
     if (!cfg.Quiet) {
-        PrintSummary(core, parity, churn, storage, scaling, cudaStats);
+        PrintSummary(core, parity, churn, storageProfiles, scaling, cudaStats);
     }
-    WriteJson(cfg.OutputPath, cfg, core, parity, churn, storage, scaling, cudaStats);
+    WriteJson(cfg.OutputPath, cfg, core, parity, churn, storageProfiles, scaling, cudaStats);
     std::cout << "Wrote benchmark results: " << cfg.OutputPath << std::endl;
     return 0;
 }
